@@ -11,6 +11,7 @@ function emptyState() {
     levels,
     sessions: [],
     weights: [],
+    levelLog: [],
     draft: null,
   };
 }
@@ -311,11 +312,18 @@ function renderSession() {
     const trainedYesterday = state.sessions.some((s) => s.date === addDays(t, -1));
     view.innerHTML =
       renderWeek() +
+      exportBanner() +
       `<section class="card center">
         <div class="huge">✅</div>
         <h2>Séance validée</h2>
         <p class="muted">Bien joué. Récupère, mange bien, dors.${trainedYesterday ? " Deux jours d'affilée : demain, repos." : ""}</p>
+      </section>
+      <section class="card">
+        <h3>Ta séance du jour</h3>
+        ${sessionLines(doneToday)}
+        <button class="ghost" id="reopen">✏️ Modifier / compléter la séance</button>
       </section>`;
+    $("#reopen").addEventListener("click", () => reopenSession(doneToday));
     return;
   }
 
@@ -323,6 +331,7 @@ function renderSession() {
   const trainedDayBefore = state.sessions.some((s) => s.date === addDays(d.date, -1));
   view.innerHTML =
     renderWeek() +
+    exportBanner() +
     `<section class="card">
       <div class="seg">
         <button data-mode="parc" class="${d.mode === "parc" ? "on" : ""}">🌳 Parc</button>
@@ -455,11 +464,11 @@ function validateSession() {
     results[ex.id] = { level: lvl, home: stepFor(ex, lvl, d.mode === "maison").isHome, sets: dense(d.sets[ex.id]), extras };
   });
   const bonus = d.bonus.map((b) => ({ name: b.name, unit: b.unit, sets: dense(b.sets) })).filter((b) => countFilled(b.sets) > 0);
-  state.sessions.push({ date: d.date, mode: d.mode, complete, results, bonus });
+  state.sessions.push({ date: d.date, mode: d.mode, complete, checks: { ...d.checks }, results, bonus });
   state.sessions.sort((a, b) => a.date.localeCompare(b.date));
   state.draft = null;
 
-  const ups = checkLevelUps();
+  const ups = checkLevelUps(d.date);
   save();
   renderSession();
   if (ups.length) toast("🎉 Palier suivant : " + ups.join(", "));
@@ -468,7 +477,7 @@ function validateSession() {
 
 // Monte d'un palier si toutes les séries ont atteint `max` sur les N dernières séances à ce palier.
 // Seul le palier principal compte (pas les paliers en plus ni la variante maison).
-function checkLevelUps() {
+function checkLevelUps(date) {
   const ups = [];
   PROGRAM.exercises.forEach((ex) => {
     const lvl = state.levels[ex.id];
@@ -480,10 +489,38 @@ function checkLevelUps() {
     if (recent.length < PROGRAM.advanceAfter) return;
     if (recent.every((s) => dense(s.results[ex.id].sets).every((v) => v >= max))) {
       state.levels[ex.id] = lvl + 1;
+      state.levelLog.push({ date, exId: ex.id, level: lvl + 1 });
       ups.push(ex.ladder[lvl + 1].name);
     }
   });
   return ups;
+}
+
+// Rouvre la séance du jour en brouillon pour la compléter. Les paliers reviennent à ceux
+// de la séance : la revalidation refera la montée si elle est toujours méritée.
+function reopenSession(s) {
+  const d = {
+    date: s.date,
+    mode: s.mode,
+    checks: s.checks || (s.complete ? { warmup: true, mobility: true, cooldown: true } : {}),
+    sets: {},
+    extras: {},
+    bonus: (s.bonus || []).map((b) => ({ ...b, sets: [...b.sets] })),
+    touched: Date.now(),
+  };
+  PROGRAM.exercises.forEach((ex) => {
+    const r = s.results[ex.id];
+    if (!r) return;
+    state.levels[ex.id] = Math.min(r.level, ex.ladder.length - 1);
+    d.sets[ex.id] = [...r.sets];
+    d.extras[ex.id] = (r.extras || []).map((x) => ({ ...x, sets: [...x.sets] }));
+  });
+  state.levelLog = state.levelLog.filter((l) => l.date !== s.date);
+  state.sessions = state.sessions.filter((x) => x !== s);
+  state.draft = d;
+  save();
+  renderSession();
+  window.scrollTo(0, 0);
 }
 
 // ---------- Minuteur de repos ----------
@@ -513,6 +550,121 @@ function stopRest() {
   $("#restbar").classList.remove("show");
 }
 
+// ---------- Graphiques ----------
+function dayNum(dateStr) {
+  return Math.round(parseYmd(dateStr).getTime() / 864e5);
+}
+function shortDate(dateStr) {
+  return parseYmd(dateStr).toLocaleDateString("fr-FR", { day: "numeric", month: "numeric" });
+}
+// Graduations « rondes » couvrant [lo, hi], environ 3 intervalles.
+function niceScale(lo, hi, integer) {
+  const raw = (hi - lo || Math.max(1, Math.abs(hi) * 0.02)) / 3;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const steps = integer ? [1, 2, 5, 10] : [1, 2, 2.5, 5, 10];
+  const step = Math.max(integer ? 1 : 0, steps.map((m) => m * mag).find((s) => s >= raw));
+  return { lo: Math.floor(lo / step) * step, hi: Math.ceil(hi / step) * step || step, step };
+}
+
+// Courbe SVG d'une seule série. points : [{ date, y, seg, tip }]. La ligne se coupe à chaque
+// changement de `seg` (nouveau palier) avec un repère vertical étiqueté par labels[seg].
+function lineChart(points, { from0 = false, integer = true, labels = {} } = {}) {
+  const W = 320, H = 150, L = 34, R = 12, T = 20, B = 22;
+  const xs = points.map((p) => dayNum(p.date));
+  const ys = points.map((p) => p.y);
+  let x0 = Math.min(...xs), x1 = Math.max(...xs);
+  if (x0 === x1) { x0 -= 1; x1 += 1; }
+  const sc = niceScale(from0 ? 0 : Math.min(...ys), Math.max(...ys), integer);
+  const sx = (x) => L + ((x - x0) / (x1 - x0)) * (W - L - R);
+  const sy = (y) => T + (1 - (y - sc.lo) / (sc.hi - sc.lo)) * (H - T - B);
+  const fmt = (v) => (Number.isInteger(v) ? v : v.toFixed(1));
+
+  let svg = "";
+  for (let v = sc.lo; v <= sc.hi + sc.step / 2; v += sc.step) {
+    const y = sy(v).toFixed(1);
+    svg += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y}" y2="${y}"/><text class="axis" x="${L - 6}" y="${y}" dy="4" text-anchor="end">${fmt(v)}</text>`;
+  }
+  svg += `<text class="axis" x="${L}" y="${H - 4}">${shortDate(points[0].date)}</text>`;
+  if (points.length > 1) svg += `<text class="axis" x="${W - R}" y="${H - 4}" text-anchor="end">${shortDate(points[points.length - 1].date)}</text>`;
+
+  // Segments par palier, repère au début de chaque nouveau palier
+  let lastLabelX = -Infinity;
+  let path = "";
+  points.forEach((p, i) => {
+    const x = sx(xs[i]).toFixed(1), y = sy(p.y).toFixed(1);
+    const newSeg = i === 0 || p.seg !== points[i - 1].seg;
+    if (newSeg && i > 0) svg += `<line class="mark" x1="${x}" x2="${x}" y1="${T - 4}" y2="${H - B}"/>`;
+    if (newSeg && labels[p.seg] && x - lastLabelX > 44) {
+      svg += `<text class="axis" x="${Math.min(x, W - R - 40)}" y="${T - 8}">${esc(labels[p.seg])}</text>`;
+      lastLabelX = x;
+    }
+    path += `${newSeg ? "M" : "L"}${x} ${y}`;
+  });
+  svg += `<path class="line" d="${path}"/>`;
+  points.forEach((p, i) => {
+    const x = sx(xs[i]), y = sy(p.y);
+    svg += `<circle class="dot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4"/>`;
+    svg += `<circle class="hit" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="14" data-tip="${esc(p.tip)}" data-px="${((x / W) * 100).toFixed(1)}" data-py="${((y / H) * 100).toFixed(1)}"/>`;
+  });
+  return `<div class="chart"><svg viewBox="0 0 ${W} ${H}" role="img">${svg}</svg><div class="tip" hidden></div></div>`;
+}
+
+// Bulle d'info au toucher d'un point
+document.addEventListener("click", (e) => {
+  document.querySelectorAll(".chart .tip").forEach((t) => (t.hidden = true));
+  const hit = e.target.closest && e.target.closest(".chart [data-tip]");
+  if (!hit) return;
+  const tip = hit.closest(".chart").querySelector(".tip");
+  tip.textContent = hit.dataset.tip;
+  tip.style.left = `${Math.min(Math.max(+hit.dataset.px, 20), 80)}%`;
+  tip.style.top = `${hit.dataset.py}%`;
+  tip.hidden = false;
+});
+
+// Volume par séance du palier principal d'un exo (total des 3 tours).
+function exerciseChart(ex) {
+  const points = state.sessions
+    .filter((s) => s.results[ex.id] && countFilled(s.results[ex.id].sets) > 0)
+    .map((s) => {
+      const r = s.results[ex.id];
+      const st = stepFor(ex, r.level, r.home);
+      const sets = dense(r.sets);
+      const total = sets.reduce((a, b) => a + b, 0);
+      return {
+        date: s.date,
+        y: total,
+        seg: `${r.level}${r.home ? "h" : ""}`,
+        tip: `${prettyDate(s.date)} · ${st.name} · ${sets.join("·")} = ${total} ${unitLabel(st.unit)}`,
+      };
+    });
+  if (points.length < 2) return "";
+  const labels = {};
+  points.forEach((p) => (labels[p.seg] = `P${parseInt(p.seg, 10) + 1}${p.seg.endsWith("h") ? " maison" : ""}`));
+  const unit = unitLabel(ex.ladder[0].unit);
+  return `<p class="muted small chart-title">Total par séance (${unit}), palier principal</p>` + lineChart(points, { from0: true, labels });
+}
+
+// Journal : première séance, premières fois à chaque palier (même en « palier en plus »), paliers débloqués.
+function milestones() {
+  const ev = [];
+  if (state.sessions.length) ev.push({ date: state.sessions[0].date, icon: "🚀", text: "Première séance" });
+  PROGRAM.exercises.forEach((ex) =>
+    ex.ladder.forEach((st, lvl) => {
+      if (lvl === 0) return;
+      const label = `${st.name} (${st.min}–${st.max} ${unitLabel(st.unit)})`;
+      const first = state.sessions.find((s) => {
+        const r = s.results[ex.id];
+        return r && [r, ...(r.extras || [])].some((e) => e.level === lvl && !e.home && countFilled(e.sets) > 0);
+      });
+      if (first) ev.push({ date: first.date, icon: "⭐", text: `Première fois : ${label}` });
+      state.levelLog
+        .filter((l) => l.date && l.exId === ex.id && l.level === lvl)
+        .forEach((l) => ev.push({ date: l.date, icon: "🎉", text: `Palier débloqué : ${label}` }));
+    })
+  );
+  return ev.sort((a, b) => b.date.localeCompare(a.date));
+}
+
 // ---------- Rendu : Progrès ----------
 function renderProgress() {
   const view = $("#view");
@@ -539,13 +691,19 @@ function renderProgress() {
           <div class="lvl-btns"><button data-down="${ex.id}" ${lvl === 0 ? "disabled" : ""}>−</button><button data-up="${ex.id}" ${lvl >= ex.ladder.length - 1 ? "disabled" : ""}>+</button></div>
         </div>
         <ol class="ladder">${steps}</ol>
+        ${exerciseChart(ex)}
         ${last ? `<div class="hist-list">${last}</div>` : `<p class="muted small">Pas encore de séance.</p>`}
       </section>`;
     })
     .join("");
 
+  const journal = milestones()
+    .map((m) => `<div class="hist"><span>${prettyDate(m.date)}</span><span class="grow">${m.icon} ${esc(m.text)}</span></div>`)
+    .join("");
+
   view.innerHTML =
     `<p class="muted small pad">Monte d'un palier automatiquement quand tu fais le max sur les ${PROGRAM.rounds} tours, ${PROGRAM.advanceAfter} séances de suite. Les boutons − / + ajustent à la main.</p>` +
+    `<section class="card"><h3>🏅 Journal</h3>${journal || `<p class="muted small">Tes premières fois apparaîtront ici.</p>`}</section>` +
     cards;
 
   view.querySelectorAll("[data-up]").forEach((b) =>
@@ -565,33 +723,37 @@ function renderProgress() {
 }
 
 // ---------- Rendu : Historique ----------
+// Détail d'une séance : une ligne par palier travaillé, puis les bonus.
+function sessionLines(s) {
+  const line = (name, sets, unit, tag) =>
+    `<div class="hist"><span class="grow">${esc(name)}${tag ? ` <span class="tag">${tag}</span>` : ""}</span><b>${dense(sets).join(" · ")} <small class="muted">${unitLabel(unit)}</small></b></div>`;
+  const lines = PROGRAM.exercises.flatMap((ex) => {
+    const r = s.results[ex.id];
+    if (!r) return [];
+    return [r, ...(r.extras || [])]
+      .filter((e) => countFilled(e.sets) > 0)
+      .map((e) => {
+        const st = stepFor(ex, e.level, e.home);
+        return line(st.name, e.sets, st.unit, e.home ? "maison" : "");
+      });
+  });
+  (s.bonus || []).forEach((b) => lines.push(line(b.name, b.sets, b.unit, "bonus")));
+  return lines.join("") || `<p class="muted small">Aucune série notée.</p>`;
+}
+
 function renderHistory() {
   const view = $("#view");
   if (!state.sessions.length) {
     view.innerHTML = `<section class="card"><p class="muted small">Rien pour l'instant. La première, c'est la plus dure.</p></section>`;
     return;
   }
-  const line = (name, sets, unit, tag) =>
-    `<div class="hist"><span class="grow">${esc(name)}${tag ? ` <span class="tag">${tag}</span>` : ""}</span><b>${dense(sets).join(" · ")} <small class="muted">${unitLabel(unit)}</small></b></div>`;
-
   const items = state.sessions
     .map((s, i) => ({ s, i }))
     .reverse()
     .map(({ s, i }, n) => {
-      const lines = PROGRAM.exercises.flatMap((ex) => {
-        const r = s.results[ex.id];
-        if (!r) return [];
-        return [r, ...(r.extras || [])]
-          .filter((e) => countFilled(e.sets) > 0)
-          .map((e) => {
-            const st = stepFor(ex, e.level, e.home);
-            return line(st.name, e.sets, st.unit, e.home ? "maison" : "");
-          });
-      });
-      (s.bonus || []).forEach((b) => lines.push(line(b.name, b.sets, b.unit, "bonus")));
       return `<details class="card sess" ${n === 0 ? "open" : ""}>
         <summary><span>${prettyDate(s.date)}</span><span class="muted">${s.mode === "maison" ? "🏠 maison" : "🌳 parc"}</span><b class="${s.complete ? "ok" : ""}">${s.complete ? "✓ complète" : "partielle"}</b></summary>
-        <div class="sess-body">${lines.join("") || `<p class="muted small">Aucune série notée.</p>`}
+        <div class="sess-body">${sessionLines(s)}
           <button class="ghost danger small" data-delsess="${i}">Supprimer cette séance</button></div>
       </details>`;
     })
@@ -641,6 +803,14 @@ function renderWeight() {
         ? `<section class="card center"><div class="big">${fmt(last.kg - first.kg)} <small>kg</small></div><div class="muted">depuis le ${prettyDate(first.date)}</div></section>`
         : ""
     }
+    ${
+      sorted.length > 1
+        ? `<section class="card"><h3>Évolution <span class="muted small">· kg</span></h3>${lineChart(
+            sorted.map((w) => ({ date: w.date, y: w.kg, seg: "w", tip: `${prettyDate(w.date)} · ${w.kg.toFixed(1)} kg` })),
+            { integer: false }
+          )}</section>`
+        : ""
+    }
     <section class="card">
       <h3>Nouvelle pesée</h3>
       <div class="row">
@@ -686,9 +856,10 @@ function renderSettings() {
     </section>
     <section class="card">
       <h3>Sauvegarde</h3>
-      <p class="muted small">Tes données restent sur ce téléphone. Exporte-les de temps en temps.</p>
+      <p class="muted small">Tes données restent sur ce téléphone. Exporte-les de temps en temps.
+        ${state.settings.lastExport ? `Dernier export : ${prettyDate(state.settings.lastExport)}.` : "Jamais exporté."}</p>
       <div class="row">
-        <button class="ghost" id="export">Exporter</button>
+        <button class="ghost" data-export>Exporter</button>
         <label class="ghost file">Importer<input type="file" id="import" accept="application/json"></label>
       </div>
     </section>
@@ -705,14 +876,6 @@ function renderSettings() {
       renderSettings();
     })
   );
-  $("#export").addEventListener("click", () => {
-    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `calliboss-${today()}.json`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-  });
   $("#import").addEventListener("change", async (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -736,6 +899,35 @@ function renderSettings() {
     renderSettings();
   });
 }
+
+// ---------- Sauvegarde ----------
+const EXPORT_EVERY = 30; // jours
+function exportData() {
+  state.settings.lastExport = today();
+  save();
+  const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `calliboss-${today()}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+// Rappel d'export dès qu'il y a quelque chose à perdre et que le dernier date d'un mois.
+function exportBanner() {
+  if (state.sessions.length < 3) return "";
+  const last = state.settings.lastExport;
+  const days = last ? dayNum(today()) - dayNum(last) : null;
+  if (days !== null && days < EXPORT_EVERY) return "";
+  return `<section class="card banner export">
+    <span class="small">💾 ${last ? `Dernier export il y a ${days} jours.` : "Tes séances ne sont sauvegardées que sur ce téléphone."}</span>
+    <button class="ghost" data-export>Exporter</button></section>`;
+}
+document.addEventListener("click", (e) => {
+  if (!e.target.closest || !e.target.closest("[data-export]")) return;
+  exportData();
+  toast("Fichier exporté : garde-le hors du téléphone (Drive, mail…)");
+  TABS[tab]();
+});
 
 // ---------- Navigation ----------
 const TABS = { seance: renderSession, progres: renderProgress, historique: renderHistory, poids: renderWeight, reglages: renderSettings };

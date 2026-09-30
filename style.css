@@ -8,6 +8,7 @@
   --accent-ink: #ffffff;
   --ok: #3ecf8e;
   --bad: #ff5c5c;
+  --chart: #f2601f;
 }
 @media (prefers-color-scheme: light) {
   :root {
@@ -18,6 +19,7 @@
     --muted: #6b717d;
     --ok: #16a36a;
     --bad: #d93b3b;
+    --chart: #e0551a;
   }
 }
 
@@ -158,3 +160,22 @@ select { font: inherit; color: var(--text); background: var(--bg); border: 1px s
 .sess-body { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 4px; }
 .sess-body .hist > span.grow { min-width: 0; flex: 1; }
 .sess-body .danger { font-size: 14px; padding: 8px 12px; }
+
+/* Graphiques */
+.chart-title { margin: 4px 0 2px; }
+.chart { position: relative; margin: 4px 0 10px; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.chart .grid { stroke: var(--line); stroke-width: 1; }
+.chart .mark { stroke: var(--muted); stroke-width: 1; opacity: .5; }
+.chart .axis { fill: var(--muted); font-size: 10px; }
+.chart .line { fill: none; stroke: var(--chart); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart .dot { fill: var(--chart); stroke: var(--card); stroke-width: 2; }
+.chart .hit { fill: transparent; cursor: pointer; }
+.chart .tip {
+  position: absolute; transform: translate(-50%, calc(-100% - 12px)); pointer-events: none;
+  background: var(--text); color: var(--bg); font-size: 12px; font-weight: 600; line-height: 1.3;
+  padding: 6px 8px; border-radius: 8px; width: max-content; max-width: 220px; text-align: center;
+}
+.hist > span.grow { min-width: 0; flex: 1; }
+.banner.export { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.banner.export .ghost { margin: 0; flex: none; }
