@@ -85,11 +85,20 @@ function unitLabel(u) {
   return u === "s" ? "s" : "reps";
 }
 
-// Palier effectif d'un exercice selon le mode (parc / maison)
-function currentStep(ex, mode) {
-  const step = ex.ladder[state.levels[ex.id]];
-  if (mode === "maison" && step.home) return { ...step.home, isHome: true };
+// Palier d'un exercice, variante maison si demandée et disponible.
+// Le niveau est borné pour survivre à une échelle raccourcie dans program.js.
+function stepFor(ex, level, home) {
+  const step = ex.ladder[Math.min(level, ex.ladder.length - 1)];
+  if (home && step.home) return { ...step.home, isHome: true };
   return { ...step, isHome: false };
+}
+
+// Séries toujours de longueur `rounds`, sans trous (0 = pas fait).
+function dense(sets) {
+  return Array.from({ length: PROGRAM.rounds }, (_, i) => (sets && sets[i]) || 0);
+}
+function countFilled(sets) {
+  return (sets || []).filter((v) => v > 0).length;
 }
 
 function sessionDates() {
@@ -113,13 +122,54 @@ function weeksStreak() {
   return streak;
 }
 
-// ---------- Brouillon de la séance du jour ----------
+// Dernière perf notée pour un exo à un palier donné (principal ou palier en plus).
+function lastPerf(exId, level, home) {
+  for (let i = state.sessions.length - 1; i >= 0; i--) {
+    const r = state.sessions[i].results[exId];
+    if (!r) continue;
+    const e = [r, ...(r.extras || [])].find((e) => e.level === level && !!e.home === home && countFilled(e.sets) > 0);
+    if (e) return { date: state.sessions[i].date, sets: dense(e.sets) };
+  }
+  return null;
+}
+function lastBonus(name) {
+  const key = name.trim().toLowerCase();
+  for (let i = state.sessions.length - 1; i >= 0; i--) {
+    const b = (state.sessions[i].bonus || []).find((b) => b.name.trim().toLowerCase() === key);
+    if (b) return { date: state.sessions[i].date, sets: dense(b.sets) };
+  }
+  return null;
+}
+function lastLine(last) {
+  return last ? `<div class="last">Dernière fois (${prettyDate(last.date)}) : <b>${last.sets.join(" · ")}</b></div>` : "";
+}
+
+// ---------- Brouillon de la séance en cours ----------
+// Un brouillon commencé la veille survit à minuit tant qu'il a servi dans les dernières heures.
+const DRAFT_TTL = 4 * 3600 * 1000;
 function getDraft() {
   const t = today();
-  if (!state.draft || state.draft.date !== t) {
-    state.draft = { date: t, mode: state.draft ? state.draft.mode : "parc", checks: {}, sets: {} };
+  const d = state.draft;
+  const stale =
+    !d ||
+    (d.date !== t && Date.now() - (d.touched || 0) > DRAFT_TTL) ||
+    state.sessions.some((s) => s.date === d.date);
+  if (stale) {
+    state.draft = { date: t, mode: d ? d.mode : "parc", checks: {}, sets: {}, extras: {}, bonus: [], touched: Date.now() };
   }
+  state.draft.extras = state.draft.extras || {};
+  state.draft.bonus = state.draft.bonus || [];
   return state.draft;
+}
+function touch() {
+  getDraft().touched = Date.now();
+  save();
+}
+function hasSetData(d) {
+  return (
+    Object.values(d.sets).some((a) => countFilled(a) > 0) ||
+    Object.values(d.extras).some((xs) => xs.some((x) => countFilled(x.sets) > 0))
+  );
 }
 
 // ---------- Rendu : Séance ----------
@@ -155,34 +205,100 @@ function checkItem(key, label) {
     <span class="box"></span><span>${esc(label)}</span></label>`;
 }
 
+function setInputs(attrs, sets, placeholder) {
+  return Array.from({ length: PROGRAM.rounds }, (_, i) => {
+    const v = (sets && sets[i]) || "";
+    return `<label class="set"><span>T${i + 1}</span>
+      <input type="number" inputmode="numeric" min="0" ${attrs} data-set="${i}" value="${v}" placeholder="${placeholder}"></label>`;
+  }).join("");
+}
+
+function stepHead(step, prefix) {
+  return `<div class="ex-name">${prefix}${esc(step.name)}${step.isHome ? ` <span class="tag">maison</span>` : ""}</div>
+    <div class="muted">${step.min}–${step.max} ${unitLabel(step.unit)} par tour${step.tip ? " · " + esc(step.tip) : ""}</div>`;
+}
+
 function exerciseCard(ex) {
   const d = getDraft();
-  const step = currentStep(ex, d.mode);
+  const home = d.mode === "maison";
+  const lvl = state.levels[ex.id];
+  const step = stepFor(ex, lvl, home);
   const sets = d.sets[ex.id] || [];
-  const filled = sets.filter((v) => v > 0).length;
+  const filled = countFilled(sets);
   const complete = filled === PROGRAM.rounds;
-  const inputs = Array.from({ length: PROGRAM.rounds }, (_, i) => {
-    const v = sets[i] || "";
-    return `<label class="set"><span>T${i + 1}</span>
-      <input type="number" inputmode="numeric" min="0" data-ex="${ex.id}" data-set="${i}" value="${v}" placeholder="${step.min}"></label>`;
-  }).join("");
+
+  const extras = (d.extras[ex.id] || [])
+    .map((x, j) => {
+      const st = stepFor(ex, x.level, x.home);
+      return `<div class="extra">
+        <div class="ex-head"><div>${stepHead(st, "+ ")}</div>
+          <button class="x" data-rmextra="${ex.id}" data-idx="${j}" aria-label="Retirer">×</button></div>
+        ${lastLine(lastPerf(ex.id, x.level, x.home))}
+        <div class="sets">${setInputs(`data-ex="${ex.id}" data-extra="${j}"`, x.sets, st.min)}</div>
+      </div>`;
+    })
+    .join("");
+
+  const options = ex.ladder
+    .map((_, i) => i)
+    .filter((i) => i !== lvl)
+    .map((i) => {
+      const st = stepFor(ex, i, home);
+      return `<option value="${i}">${esc(st.name)} (${st.min}–${st.max} ${unitLabel(st.unit)})</option>`;
+    })
+    .join("");
+
   return `
-    <div class="ex ${complete ? "complete" : ""}">
+    <div class="ex ${complete ? "complete" : ""}" data-card="${ex.id}">
       <div class="ex-head">
-        <div>
-          <div class="ex-name">${esc(step.name)}${step.isHome ? ` <span class="tag">maison</span>` : ""}</div>
-          <div class="muted">${step.min}–${step.max} ${unitLabel(step.unit)} par tour${step.tip ? " · " + esc(step.tip) : ""}</div>
-        </div>
+        <div>${stepHead(step, "")}</div>
         <div class="ex-status">${complete ? "✓" : `${filled}/${PROGRAM.rounds}`}</div>
       </div>
-      <div class="sets">${inputs}</div>
+      ${lastLine(lastPerf(ex.id, lvl, step.isHome))}
+      <div class="sets">${setInputs(`data-ex="${ex.id}"`, sets, step.min)}</div>
+      ${extras}
+      ${options ? `<select class="addvar" data-addvar="${ex.id}"><option value="">+ faire aussi un autre palier</option>${options}</select>` : ""}
     </div>`;
+}
+
+function bonusSection() {
+  const d = getDraft();
+  const rows = d.bonus
+    .map(
+      (b, j) => `<div class="ex">
+        <div class="ex-head"><div><div class="ex-name">${esc(b.name)}</div><div class="muted">${unitLabel(b.unit)} par tour</div></div>
+          <button class="x" data-rmbonus="${j}" aria-label="Retirer">×</button></div>
+        ${lastLine(lastBonus(b.name))}
+        <div class="sets">${setInputs(`data-bonus="${j}"`, b.sets, "")}</div>
+      </div>`
+    )
+    .join("");
+  const names = new Set();
+  PROGRAM.exercises.forEach((ex) =>
+    ex.ladder.forEach((st) => {
+      names.add(st.name);
+      if (st.home) names.add(st.home.name);
+    })
+  );
+  state.sessions.forEach((s) => (s.bonus || []).forEach((b) => names.add(b.name)));
+  return `
+    <section class="card">
+      <h3>3. Bonus <span class="muted small">· optionnel</span></h3>
+      <p class="muted small">Envie d'en faire plus ? Ajoute un exo, il sera gardé dans l'historique.</p>
+      ${rows}
+      <div class="row addbonus">
+        <input type="text" id="bname" list="exnames" placeholder="Nom de l'exo" autocomplete="off">
+        <select id="bunit"><option value="reps">reps</option><option value="s">s</option></select>
+        <button class="primary small" id="addbonus">+</button>
+      </div>
+      <datalist id="exnames">${[...names].map((n) => `<option value="${esc(n)}">`).join("")}</datalist>
+    </section>`;
 }
 
 function sessionComplete() {
   const d = getDraft();
   const checksOk = ["warmup", "mobility", "cooldown"].every((k) => d.checks[k]);
-  const setsOk = PROGRAM.exercises.every((ex) => (d.sets[ex.id] || []).filter((v) => v > 0).length === PROGRAM.rounds);
+  const setsOk = PROGRAM.exercises.every((ex) => countFilled(d.sets[ex.id]) === PROGRAM.rounds);
   return checksOk && setsOk;
 }
 
@@ -192,19 +308,19 @@ function renderSession() {
   const doneToday = state.sessions.find((s) => s.date === t);
 
   if (doneToday) {
-    const yesterday = state.sessions.find((s) => s.date === addDays(t, -1));
+    const trainedYesterday = state.sessions.some((s) => s.date === addDays(t, -1));
     view.innerHTML =
       renderWeek() +
       `<section class="card center">
         <div class="huge">✅</div>
         <h2>Séance validée</h2>
-        <p class="muted">Bien joué. Récupère, mange bien, dors.${yesterday ? "" : " Demain peut être un jour de repos."}</p>
+        <p class="muted">Bien joué. Récupère, mange bien, dors.${trainedYesterday ? " Deux jours d'affilée : demain, repos." : ""}</p>
       </section>`;
     return;
   }
 
   const d = getDraft();
-  const prevToday = state.sessions.find((s) => s.date === addDays(t, -1));
+  const trainedDayBefore = state.sessions.some((s) => s.date === addDays(d.date, -1));
   view.innerHTML =
     renderWeek() +
     `<section class="card">
@@ -212,7 +328,8 @@ function renderSession() {
         <button data-mode="parc" class="${d.mode === "parc" ? "on" : ""}">🌳 Parc</button>
         <button data-mode="maison" class="${d.mode === "maison" ? "on" : ""}">🏠 Plan B maison</button>
       </div>
-      ${prevToday ? `<p class="muted small">Tu t'es entraîné hier : un jour de repos compte aussi.</p>` : ""}
+      ${d.date !== t ? `<p class="muted small">Séance commencée le ${prettyDate(d.date)} : elle sera enregistrée à cette date.</p>` : ""}
+      ${trainedDayBefore ? `<p class="muted small">Tu t'es entraîné la veille : un jour de repos compte aussi.</p>` : ""}
     </section>
 
     <section class="card">
@@ -228,8 +345,10 @@ function renderSession() {
       <button class="ghost" id="rest">⏱ Repos 2:00</button>
     </section>
 
+    ${bonusSection()}
+
     <section class="card">
-      <h3>3. Retour au calme</h3>
+      <h3>4. Retour au calme</h3>
       ${checkItem("cooldown", PROGRAM.cooldown[d.mode])}
     </section>
 
@@ -237,40 +356,80 @@ function renderSession() {
 
   view.querySelectorAll("[data-mode]").forEach((b) =>
     b.addEventListener("click", () => {
-      getDraft().mode = b.dataset.mode;
-      getDraft().sets = {};
-      save();
+      const dr = getDraft();
+      if (dr.mode === b.dataset.mode) return;
+      if (hasSetData(dr) && !confirm("Changer de lieu efface les reps notées dans le circuit. Continuer ?")) return;
+      dr.mode = b.dataset.mode;
+      dr.sets = {};
+      dr.extras = {};
+      touch();
       renderSession();
     })
   );
   view.querySelectorAll("[data-check]").forEach((c) =>
     c.addEventListener("change", () => {
       getDraft().checks[c.dataset.check] = c.checked;
-      save();
+      touch();
       c.closest(".check").classList.toggle("on", c.checked);
       updateValidateLabel();
     })
   );
-  view.querySelectorAll("[data-ex]").forEach((inp) =>
+  view.querySelectorAll("input[data-set]").forEach((inp) =>
     inp.addEventListener("input", () => {
-      const dr = getDraft();
-      const arr = dr.sets[inp.dataset.ex] || [];
       const v = parseInt(inp.value, 10);
-      arr[+inp.dataset.set] = isNaN(v) ? 0 : v;
-      dr.sets[inp.dataset.ex] = arr;
-      save();
-      refreshExStatus(inp.dataset.ex);
+      setsOf(inp)[+inp.dataset.set] = isNaN(v) ? 0 : v;
+      touch();
+      if (inp.dataset.ex && inp.dataset.extra === undefined) refreshExStatus(inp.dataset.ex);
       updateValidateLabel();
     })
   );
+  view.querySelectorAll("[data-addvar]").forEach((sel) =>
+    sel.addEventListener("change", () => {
+      if (sel.value === "") return;
+      const dr = getDraft();
+      const ex = PROGRAM.exercises.find((e) => e.id === sel.dataset.addvar);
+      const level = +sel.value;
+      (dr.extras[ex.id] = dr.extras[ex.id] || []).push({ level, home: stepFor(ex, level, dr.mode === "maison").isHome, sets: [] });
+      touch();
+      renderSession();
+    })
+  );
+  view.querySelectorAll("[data-rmextra]").forEach((b) =>
+    b.addEventListener("click", () => {
+      getDraft().extras[b.dataset.rmextra].splice(+b.dataset.idx, 1);
+      touch();
+      renderSession();
+    })
+  );
+  view.querySelectorAll("[data-rmbonus]").forEach((b) =>
+    b.addEventListener("click", () => {
+      getDraft().bonus.splice(+b.dataset.rmbonus, 1);
+      touch();
+      renderSession();
+    })
+  );
+  $("#addbonus").addEventListener("click", () => {
+    const name = $("#bname").value.trim();
+    if (!name) return toast("Donne un nom à l'exo");
+    getDraft().bonus.push({ name, unit: $("#bunit").value, sets: [] });
+    touch();
+    renderSession();
+  });
   $("#rest").addEventListener("click", () => startRest(120));
   $("#validate").addEventListener("click", validateSession);
 }
 
+// Tableau de séries du brouillon visé par un champ de saisie.
+function setsOf(inp) {
+  const d = getDraft();
+  if (inp.dataset.bonus !== undefined) return d.bonus[+inp.dataset.bonus].sets;
+  if (inp.dataset.extra !== undefined) return d.extras[inp.dataset.ex][+inp.dataset.extra].sets;
+  return (d.sets[inp.dataset.ex] = d.sets[inp.dataset.ex] || []);
+}
+
 function refreshExStatus(exId) {
-  const sets = getDraft().sets[exId] || [];
-  const filled = sets.filter((v) => v > 0).length;
-  const card = document.querySelector(`[data-ex="${exId}"]`).closest(".ex");
+  const filled = countFilled(getDraft().sets[exId]);
+  const card = document.querySelector(`[data-card="${exId}"]`);
   const complete = filled === PROGRAM.rounds;
   card.classList.toggle("complete", complete);
   card.querySelector(".ex-status").textContent = complete ? "✓" : `${filled}/${PROGRAM.rounds}`;
@@ -281,17 +440,23 @@ function updateValidateLabel() {
 
 function validateSession() {
   const d = getDraft();
-  if (!sessionComplete()) {
-    const anything = Object.values(d.checks).some(Boolean) || Object.values(d.sets).some((a) => a.some((v) => v > 0));
+  const complete = sessionComplete();
+  if (!complete) {
+    const anything = Object.values(d.checks).some(Boolean) || hasSetData(d) || d.bonus.some((b) => countFilled(b.sets) > 0);
     if (!anything) return toast("Coche au moins l'échauffement 😉");
     if (!confirm("Séance incomplète. La valider quand même ? Une séance réduite vaut mieux que rien.")) return;
   }
   const results = {};
   PROGRAM.exercises.forEach((ex) => {
-    const step = currentStep(ex, d.mode);
-    results[ex.id] = { level: state.levels[ex.id], home: step.isHome, sets: (d.sets[ex.id] || []).map((v) => v || 0) };
+    const lvl = state.levels[ex.id];
+    const extras = (d.extras[ex.id] || [])
+      .map((x) => ({ level: x.level, home: x.home, sets: dense(x.sets) }))
+      .filter((x) => countFilled(x.sets) > 0);
+    results[ex.id] = { level: lvl, home: stepFor(ex, lvl, d.mode === "maison").isHome, sets: dense(d.sets[ex.id]), extras };
   });
-  state.sessions.push({ date: d.date, mode: d.mode, complete: sessionComplete(), results });
+  const bonus = d.bonus.map((b) => ({ name: b.name, unit: b.unit, sets: dense(b.sets) })).filter((b) => countFilled(b.sets) > 0);
+  state.sessions.push({ date: d.date, mode: d.mode, complete, results, bonus });
+  state.sessions.sort((a, b) => a.date.localeCompare(b.date));
   state.draft = null;
 
   const ups = checkLevelUps();
@@ -302,6 +467,7 @@ function validateSession() {
 }
 
 // Monte d'un palier si toutes les séries ont atteint `max` sur les N dernières séances à ce palier.
+// Seul le palier principal compte (pas les paliers en plus ni la variante maison).
 function checkLevelUps() {
   const ups = [];
   PROGRAM.exercises.forEach((ex) => {
@@ -312,11 +478,7 @@ function checkLevelUps() {
       .filter((s) => s.results[ex.id] && s.results[ex.id].level === lvl && !s.results[ex.id].home)
       .slice(-PROGRAM.advanceAfter);
     if (recent.length < PROGRAM.advanceAfter) return;
-    const ok = recent.every((s) => {
-      const sets = s.results[ex.id].sets;
-      return sets.length === PROGRAM.rounds && sets.every((v) => v >= max);
-    });
-    if (ok) {
+    if (recent.every((s) => dense(s.results[ex.id].sets).every((v) => v >= max))) {
       state.levels[ex.id] = lvl + 1;
       ups.push(ex.ladder[lvl + 1].name);
     }
@@ -325,26 +487,26 @@ function checkLevelUps() {
 }
 
 // ---------- Minuteur de repos ----------
+// Calé sur l'heure de fin : reste juste même si le téléphone met la page en veille.
 let restTimer = null;
 function startRest(seconds) {
   const bar = $("#restbar");
-  let left = seconds;
+  const end = Date.now() + seconds * 1000;
   clearInterval(restTimer);
+  bar.innerHTML = `<span id="restleft"></span><button id="reststop">Stop</button>`;
+  $("#reststop").onclick = stopRest;
   const tick = () => {
-    const m = Math.floor(left / 60);
-    const s = String(left % 60).padStart(2, "0");
-    bar.innerHTML = `<span>Repos ${m}:${s}</span><button id="reststop">Stop</button>`;
-    $("#reststop").onclick = stopRest;
+    const left = Math.max(0, Math.ceil((end - Date.now()) / 1000));
+    $("#restleft").textContent = `Repos ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
     if (left <= 0) {
       stopRest();
       if (navigator.vibrate) navigator.vibrate([300, 150, 300]);
       toast("C'est reparti !");
     }
-    left--;
   };
   bar.classList.add("show");
   tick();
-  restTimer = setInterval(tick, 1000);
+  restTimer = setInterval(tick, 250);
 }
 function stopRest() {
   clearInterval(restTimer);
@@ -364,14 +526,13 @@ function renderProgress() {
         })
         .join("");
       const last = state.sessions
-        .filter((s) => s.results[ex.id] && s.results[ex.id].sets.some((v) => v > 0))
+        .flatMap((s) => {
+          const r = s.results[ex.id];
+          return r ? [r, ...(r.extras || [])].filter((e) => countFilled(e.sets) > 0).map((e) => ({ date: s.date, e })) : [];
+        })
         .slice(-4)
         .reverse()
-        .map((s) => {
-          const r = s.results[ex.id];
-          const name = r.home && ex.ladder[r.level].home ? ex.ladder[r.level].home.name : ex.ladder[r.level].name;
-          return `<div class="hist"><span>${prettyDate(s.date)}</span><span class="muted">${esc(name)}</span><b>${r.sets.join(" · ")}</b></div>`;
-        })
+        .map(({ date, e }) => `<div class="hist"><span>${prettyDate(date)}</span><span class="muted">${esc(stepFor(ex, e.level, e.home).name)}</span><b>${dense(e.sets).join(" · ")}</b></div>`)
         .join("");
       return `<section class="card">
         <div class="ex-head"><h3>${esc(ex.name)}</h3>
@@ -383,16 +544,9 @@ function renderProgress() {
     })
     .join("");
 
-  const history = [...state.sessions]
-    .reverse()
-    .slice(0, 20)
-    .map((s) => `<div class="hist"><span>${prettyDate(s.date)}</span><span class="muted">${s.mode === "maison" ? "🏠 maison" : "🌳 parc"}</span><b>${s.complete ? "✓" : "partielle"}</b></div>`)
-    .join("");
-
   view.innerHTML =
     `<p class="muted small pad">Monte d'un palier automatiquement quand tu fais le max sur les ${PROGRAM.rounds} tours, ${PROGRAM.advanceAfter} séances de suite. Les boutons − / + ajustent à la main.</p>` +
-    cards +
-    `<section class="card"><h3>Historique · ${state.sessions.length} séance${state.sessions.length > 1 ? "s" : ""}</h3>${history || `<p class="muted small">Rien pour l'instant. La première, c'est la plus dure.</p>`}</section>`;
+    cards;
 
   view.querySelectorAll("[data-up]").forEach((b) =>
     b.addEventListener("click", () => {
@@ -406,6 +560,51 @@ function renderProgress() {
       state.levels[b.dataset.down]--;
       save();
       renderProgress();
+    })
+  );
+}
+
+// ---------- Rendu : Historique ----------
+function renderHistory() {
+  const view = $("#view");
+  if (!state.sessions.length) {
+    view.innerHTML = `<section class="card"><p class="muted small">Rien pour l'instant. La première, c'est la plus dure.</p></section>`;
+    return;
+  }
+  const line = (name, sets, unit, tag) =>
+    `<div class="hist"><span class="grow">${esc(name)}${tag ? ` <span class="tag">${tag}</span>` : ""}</span><b>${dense(sets).join(" · ")} <small class="muted">${unitLabel(unit)}</small></b></div>`;
+
+  const items = state.sessions
+    .map((s, i) => ({ s, i }))
+    .reverse()
+    .map(({ s, i }, n) => {
+      const lines = PROGRAM.exercises.flatMap((ex) => {
+        const r = s.results[ex.id];
+        if (!r) return [];
+        return [r, ...(r.extras || [])]
+          .filter((e) => countFilled(e.sets) > 0)
+          .map((e) => {
+            const st = stepFor(ex, e.level, e.home);
+            return line(st.name, e.sets, st.unit, e.home ? "maison" : "");
+          });
+      });
+      (s.bonus || []).forEach((b) => lines.push(line(b.name, b.sets, b.unit, "bonus")));
+      return `<details class="card sess" ${n === 0 ? "open" : ""}>
+        <summary><span>${prettyDate(s.date)}</span><span class="muted">${s.mode === "maison" ? "🏠 maison" : "🌳 parc"}</span><b class="${s.complete ? "ok" : ""}">${s.complete ? "✓ complète" : "partielle"}</b></summary>
+        <div class="sess-body">${lines.join("") || `<p class="muted small">Aucune série notée.</p>`}
+          <button class="ghost danger small" data-delsess="${i}">Supprimer cette séance</button></div>
+      </details>`;
+    })
+    .join("");
+
+  view.innerHTML = `<p class="muted small pad">${state.sessions.length} séance${state.sessions.length > 1 ? "s" : ""} · touche une séance pour voir le détail.</p>` + items;
+
+  view.querySelectorAll("[data-delsess]").forEach((b) =>
+    b.addEventListener("click", () => {
+      if (!confirm("Supprimer cette séance ? Les paliers ne sont pas recalculés (ajuste-les dans Progrès si besoin).")) return;
+      state.sessions.splice(+b.dataset.delsess, 1);
+      save();
+      renderHistory();
     })
   );
 }
@@ -445,7 +644,7 @@ function renderWeight() {
     <section class="card">
       <h3>Nouvelle pesée</h3>
       <div class="row">
-        <input type="number" inputmode="decimal" step="0.1" id="kg" placeholder="kg">
+        <input type="text" inputmode="decimal" id="kg" placeholder="kg">
         <input type="date" id="wdate" value="${t}">
         <button class="primary small" id="addw">OK</button>
       </div>
@@ -539,7 +738,7 @@ function renderSettings() {
 }
 
 // ---------- Navigation ----------
-const TABS = { seance: renderSession, progres: renderProgress, poids: renderWeight, reglages: renderSettings };
+const TABS = { seance: renderSession, progres: renderProgress, historique: renderHistory, poids: renderWeight, reglages: renderSettings };
 let tab = "seance";
 function show(name) {
   tab = name;

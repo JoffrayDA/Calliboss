@@ -89,7 +89,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .sets { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
 .set { display: flex; align-items: center; gap: 6px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 4px 8px; }
 .set span { color: var(--muted); font-size: 13px; }
-input[type=number], input[type=date] {
+input[type=number], input[type=date], input[type=text] {
   width: 100%; min-width: 0; font: inherit; font-size: 18px; color: var(--text);
   background: transparent; border: 0; padding: 8px 0; outline: none;
 }
@@ -136,3 +136,25 @@ nav {
 nav button { flex: 1; border: 0; background: transparent; padding: 8px 0 10px; font-size: 12px; color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: 2px; }
 nav button span { font-size: 20px; }
 nav button.on { color: var(--accent); font-weight: 700; }
+
+/* Paliers en plus, bonus, dernière perf */
+.last { margin-top: 6px; font-size: 13px; color: var(--muted); }
+.last b { color: var(--text); }
+.extra { margin-top: 12px; padding-left: 12px; border-left: 2px solid var(--accent); }
+select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+.addvar { display: block; width: 100%; margin-top: 10px; font-size: 14px; color: var(--muted); background: transparent; border-style: dashed; }
+.addbonus { margin-top: 10px; }
+.addbonus input { flex: 1; font-size: 16px; }
+.addbonus .primary.small { padding: 10px 16px; }
+
+/* Historique */
+.sess summary { display: flex; gap: 10px; align-items: center; list-style: none; cursor: pointer; font-size: 15px; }
+.sess summary::-webkit-details-marker { display: none; }
+.sess summary::after { content: "▾"; color: var(--muted); transition: transform .2s; }
+.sess[open] summary::after { transform: rotate(180deg); }
+.sess summary > span:first-child { font-weight: 600; min-width: 96px; }
+.sess summary b { margin-left: auto; font-size: 14px; color: var(--muted); }
+.sess summary b.ok { color: var(--ok); }
+.sess-body { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 4px; }
+.sess-body .hist > span.grow { min-width: 0; flex: 1; }
+.sess-body .danger { font-size: 14px; padding: 8px 12px; }
