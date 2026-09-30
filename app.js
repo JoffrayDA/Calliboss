@@ -12,6 +12,8 @@ function emptyState() {
     sessions: [],
     weights: [],
     levelLog: [],
+    proposals: [], // exos prêts pour le palier suivant, en attente de ta réponse
+    transitions: {}, // exId -> date de début : le palier suivant est ajouté en « palier en plus »
     draft: null,
   };
 }
@@ -157,6 +159,7 @@ function getDraft() {
     state.sessions.some((s) => s.date === d.date);
   if (stale) {
     state.draft = { date: t, mode: d ? d.mode : "parc", checks: {}, sets: {}, extras: {}, bonus: [], touched: Date.now() };
+    seedTransitions(state.draft);
   }
   state.draft.extras = state.draft.extras || {};
   state.draft.bonus = state.draft.bonus || [];
@@ -231,8 +234,9 @@ function exerciseCard(ex) {
   const extras = (d.extras[ex.id] || [])
     .map((x, j) => {
       const st = stepFor(ex, x.level, x.home);
+      const trans = state.transitions[ex.id] && x.level === lvl + 1;
       return `<div class="extra">
-        <div class="ex-head"><div>${stepHead(st, "+ ")}</div>
+        <div class="ex-head"><div>${stepHead(st, trans ? `<span class="tag">🔀 transition</span> ` : "+ ")}</div>
           <button class="x" data-rmextra="${ex.id}" data-idx="${j}" aria-label="Retirer">×</button></div>
         ${lastLine(lastPerf(ex.id, x.level, x.home))}
         <div class="sets">${setInputs(`data-ex="${ex.id}" data-extra="${j}"`, x.sets, st.min)}</div>
@@ -312,6 +316,7 @@ function renderSession() {
     const trainedYesterday = state.sessions.some((s) => s.date === addDays(t, -1));
     view.innerHTML =
       renderWeek() +
+      proposalCards() +
       exportBanner() +
       `<section class="card center">
         <div class="huge">✅</div>
@@ -331,6 +336,7 @@ function renderSession() {
   const trainedDayBefore = state.sessions.some((s) => s.date === addDays(d.date, -1));
   view.innerHTML =
     renderWeek() +
+    proposalCards() +
     exportBanner() +
     `<section class="card">
       <div class="seg">
@@ -371,6 +377,7 @@ function renderSession() {
       dr.mode = b.dataset.mode;
       dr.sets = {};
       dr.extras = {};
+      seedTransitions(dr);
       touch();
       renderSession();
     })
@@ -468,32 +475,116 @@ function validateSession() {
   state.sessions.sort((a, b) => a.date.localeCompare(b.date));
   state.draft = null;
 
-  const ups = checkLevelUps(d.date);
+  const ready = readyForNext();
+  state.proposals = ready;
   save();
   renderSession();
-  if (ups.length) toast("🎉 Palier suivant : " + ups.join(", "));
-  else toast("Séance validée 💪");
+  toast(ready.length ? "Séance validée 💪 · 🎯 palier suivant à portée, regarde en haut" : "Séance validée 💪");
 }
 
-// Monte d'un palier si toutes les séries ont atteint `max` sur les N dernières séances à ce palier.
+// Exos où toutes les séries ont atteint `max` sur les N dernières séances au palier actuel.
 // Seul le palier principal compte (pas les paliers en plus ni la variante maison).
-function checkLevelUps(date) {
-  const ups = [];
-  PROGRAM.exercises.forEach((ex) => {
-    const lvl = state.levels[ex.id];
-    if (lvl >= ex.ladder.length - 1) return;
-    const max = ex.ladder[lvl].max;
-    const recent = state.sessions
-      .filter((s) => s.results[ex.id] && s.results[ex.id].level === lvl && !s.results[ex.id].home)
-      .slice(-PROGRAM.advanceAfter);
-    if (recent.length < PROGRAM.advanceAfter) return;
-    if (recent.every((s) => dense(s.results[ex.id].sets).every((v) => v >= max))) {
-      state.levels[ex.id] = lvl + 1;
-      state.levelLog.push({ date, exId: ex.id, level: lvl + 1 });
-      ups.push(ex.ladder[lvl + 1].name);
-    }
+// L'app ne monte jamais seule : elle propose, tu choisis (voir chooseNext).
+function readyForNext() {
+  return PROGRAM.exercises
+    .filter((ex) => {
+      const lvl = state.levels[ex.id];
+      if (lvl >= ex.ladder.length - 1) return false;
+      const max = ex.ladder[lvl].max;
+      const recent = state.sessions
+        .filter((s) => s.results[ex.id] && s.results[ex.id].level === lvl && !s.results[ex.id].home)
+        .slice(-PROGRAM.advanceAfter);
+      return recent.length === PROGRAM.advanceAfter && recent.every((s) => dense(s.results[ex.id].sets).every((v) => v >= max));
+    })
+    .map((ex) => ex.id);
+}
+
+// ---------- Montée de palier : proposée, progressive ----------
+function nextStep(ex) {
+  const lvl = state.levels[ex.id];
+  return lvl < ex.ladder.length - 1 ? ex.ladder[lvl + 1] : null;
+}
+function stepLabel(st) {
+  return `${st.name} (${st.min}–${st.max} ${unitLabel(st.unit)})`;
+}
+
+// En transition, le palier suivant est ajouté d'office en « palier en plus » à la séance.
+function seedTransitions(d) {
+  Object.keys(state.transitions).forEach((exId) => {
+    const ex = PROGRAM.exercises.find((e) => e.id === exId);
+    if (!ex || !nextStep(ex)) return;
+    const level = state.levels[exId] + 1;
+    const list = (d.extras[exId] = d.extras[exId] || []);
+    if (!list.some((x) => x.level === level)) list.push({ level, home: stepFor(ex, level, d.mode === "maison").isHome, sets: [] });
   });
-  return ups;
+}
+
+function levelUp(exId) {
+  const ex = PROGRAM.exercises.find((e) => e.id === exId);
+  if (!nextStep(ex)) return;
+  const old = state.levels[exId];
+  state.levels[exId]++;
+  state.levelLog.push({ date: today(), exId, level: state.levels[exId] });
+  delete state.transitions[exId];
+  state.proposals = state.proposals.filter((id) => id !== exId);
+  // Brouillon en cours : le nouveau palier devient le principal, l'ancien passe « en plus »
+  const d = state.draft;
+  if (d && d.sets) {
+    d.extras = d.extras || {};
+    const extras = (d.extras[exId] = d.extras[exId] || []);
+    const i = extras.findIndex((x) => x.level === old + 1);
+    const oldSets = d.sets[exId] || [];
+    d.sets[exId] = i >= 0 ? extras.splice(i, 1)[0].sets : [];
+    if (countFilled(oldSets) > 0) extras.unshift({ level: old, home: stepFor(ex, old, d.mode === "maison").isHome, sets: oldSets });
+  }
+}
+
+function chooseNext(exId, choice) {
+  const ex = PROGRAM.exercises.find((e) => e.id === exId);
+  const next = nextStep(ex);
+  if (choice === "up") {
+    levelUp(exId);
+    toast(`🎉 Nouveau palier : ${next.name}`);
+  } else if (choice === "trans") {
+    state.transitions[exId] = today();
+    state.proposals = state.proposals.filter((id) => id !== exId);
+    if (!state.sessions.some((s) => s.date === today())) seedTransitions(getDraft());
+    toast(`🔀 ${next.name} ajouté en plus à chaque séance`);
+  } else if (choice === "later") {
+    state.proposals = state.proposals.filter((id) => id !== exId);
+    toast("OK, on garde ce palier. La question reviendra.");
+  } else if (choice === "stop") {
+    delete state.transitions[exId];
+    toast("Transition arrêtée");
+  }
+  save();
+  TABS[tab]();
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest && e.target.closest("[data-choice]");
+  if (b) chooseNext(b.dataset.ex, b.dataset.choice);
+});
+
+function proposalCards() {
+  return state.proposals
+    .map((exId) => {
+      const ex = PROGRAM.exercises.find((e) => e.id === exId);
+      const next = ex && nextStep(ex);
+      if (!next) return "";
+      const cur = ex.ladder[state.levels[exId]];
+      const inTransition = !!state.transitions[exId];
+      return `<section class="card banner propose">
+        <h3>🎯 ${esc(ex.name)} : prêt pour la suite ?</h3>
+        <p class="small">Max sur les ${PROGRAM.rounds} tours, ${PROGRAM.advanceAfter} séances de suite en ${esc(cur.name)}. Palier suivant : <b>${esc(stepLabel(next))}</b>.</p>
+        <div class="choices">
+          <button class="primary small" data-ex="${exId}" data-choice="up">Passer</button>
+          ${inTransition ? "" : `<button class="ghost" data-ex="${exId}" data-choice="trans">Y aller progressivement</button>`}
+          <button class="ghost" data-ex="${exId}" data-choice="later">Pas encore</button>
+        </div>
+        ${inTransition ? "" : `<p class="muted small">Progressivement : tu gardes ${esc(cur.name)} et on ajoute ${esc(next.name)} en plus à chaque séance. Tu passes quand tu te sens prêt.</p>`}
+      </section>`;
+    })
+    .join("");
 }
 
 // Rouvre la séance du jour en brouillon pour la compléter. Les paliers reviennent à ceux
@@ -516,6 +607,7 @@ function reopenSession(s) {
     d.extras[ex.id] = (r.extras || []).map((x) => ({ ...x, sets: [...x.sets] }));
   });
   state.levelLog = state.levelLog.filter((l) => l.date !== s.date);
+  state.proposals = [];
   state.sessions = state.sessions.filter((x) => x !== s);
   state.draft = d;
   save();
@@ -660,6 +752,8 @@ function milestones() {
       state.levelLog
         .filter((l) => l.date && l.exId === ex.id && l.level === lvl)
         .forEach((l) => ev.push({ date: l.date, icon: "🎉", text: `Palier débloqué : ${label}` }));
+      if (state.transitions[ex.id] && state.levels[ex.id] + 1 === lvl)
+        ev.push({ date: state.transitions[ex.id], icon: "🔀", text: `Transition commencée : ${label}` });
     })
   );
   return ev.sort((a, b) => b.date.localeCompare(a.date));
@@ -691,6 +785,18 @@ function renderProgress() {
           <div class="lvl-btns"><button data-down="${ex.id}" ${lvl === 0 ? "disabled" : ""}>−</button><button data-up="${ex.id}" ${lvl >= ex.ladder.length - 1 ? "disabled" : ""}>+</button></div>
         </div>
         <ol class="ladder">${steps}</ol>
+        ${
+          state.transitions[ex.id] && nextStep(ex)
+            ? `<div class="transition">
+                <p class="small">🔀 En transition vers <b>${esc(nextStep(ex).name)}</b> depuis le ${prettyDate(state.transitions[ex.id])}, ajouté en plus à chaque séance.</p>
+                <div class="choices">
+                  <button class="primary small" data-ex="${ex.id}" data-choice="up">Passer maintenant</button>
+                  <button class="ghost" data-ex="${ex.id}" data-choice="stop">Arrêter la transition</button>
+                </div></div>`
+            : nextStep(ex)
+            ? `<button class="ghost small-btn" data-ex="${ex.id}" data-choice="trans">🔀 Commencer ${esc(nextStep(ex).name)} progressivement</button>`
+            : ""
+        }
         ${exerciseChart(ex)}
         ${last ? `<div class="hist-list">${last}</div>` : `<p class="muted small">Pas encore de séance.</p>`}
       </section>`;
@@ -702,20 +808,23 @@ function renderProgress() {
     .join("");
 
   view.innerHTML =
-    `<p class="muted small pad">Monte d'un palier automatiquement quand tu fais le max sur les ${PROGRAM.rounds} tours, ${PROGRAM.advanceAfter} séances de suite. Les boutons − / + ajustent à la main.</p>` +
+    `<p class="muted small pad">Quand tu fais le max sur les ${PROGRAM.rounds} tours, ${PROGRAM.advanceAfter} séances de suite, l'app te propose le palier suivant : direct ou progressivement. C'est toi qui décides. Les boutons − / + ajustent à la main.</p>` +
     `<section class="card"><h3>🏅 Journal</h3>${journal || `<p class="muted small">Tes premières fois apparaîtront ici.</p>`}</section>` +
     cards;
 
   view.querySelectorAll("[data-up]").forEach((b) =>
     b.addEventListener("click", () => {
-      state.levels[b.dataset.up]++;
+      levelUp(b.dataset.up);
       save();
       renderProgress();
     })
   );
   view.querySelectorAll("[data-down]").forEach((b) =>
     b.addEventListener("click", () => {
-      state.levels[b.dataset.down]--;
+      const id = b.dataset.down;
+      state.levels[id]--;
+      delete state.transitions[id];
+      state.proposals = state.proposals.filter((x) => x !== id);
       save();
       renderProgress();
     })
