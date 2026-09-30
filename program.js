@@ -10,15 +10,35 @@ const PROGRAM = {
   advanceAfter: 2,
 
   warmup: {
-    parc: "Course jusqu'au parc, rythme tranquille (≈12 min)",
+    parc: "Course jusqu'au parc, très facile, tu peux parler (≈12 min)",
     maison: "5 min de corde à sauter ou jumping jacks",
   },
-  mobility: "Mobilité : cercles de bras, épaules, poignets, hanches (3 min)",
+  mobility: "Mobilité : cercles de bras, épaules, poignets, hanches + 2×8 scap pulls à la barre (4 min)",
   rounds: 3,
   restBetweenRounds: "1 min 30 à 2 min de repos entre chaque tour",
   cooldown: {
     parc: "Retour en marchant/trottinant + étirements (5 min)",
     maison: "Étirements (5 min)",
+  },
+
+  // Séance course + mobilité (compteur hebdo séparé).
+  // Progression par blocs de `blockDays` jours : dans un bloc, une sortie ne dépasse pas
+  // min(capKm, growth × plus longue sortie du bloc précédent). Voir la recherche du 30/09.
+  run: {
+    weeklyGoalDefault: 2,
+    blockStart: "2026-10-01",
+    blockDays: 14,
+    growth: 1.3,
+    capKm: 10,
+    // Après la course, jamais juste avant la calisthénie (l'étirement statique baisse la force).
+    mobility: [
+      { id: "ankle", text: "Chevilles : genou au mur 2×10 par jambe, puis tenir 30 s" },
+      { id: "squat", text: "Squat profond tenu 3×30 s (tiens un poteau si besoin)" },
+      { id: "wrist", text: "Poignets : rotations + bascules à quatre pattes 2×10" },
+      { id: "shoulder", text: "Épaules : étirement doux vers l'arrière, mains sur un banc derrière toi 2×30 s" },
+      { id: "hang", text: "Suspension passive à la barre 3×20–30 s" },
+      { id: "cossack", text: "Cossack squat 2×6 par côté" },
+    ],
   },
 
   exercises: [

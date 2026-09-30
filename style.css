@@ -189,3 +189,19 @@ select { font: inherit; color: var(--text); background: var(--bg); border: 1px s
 .transition { background: var(--bg); border-radius: 12px; padding: 10px 12px; margin: 0 0 10px; }
 .transition p { margin: 0 0 8px; }
 .small-btn { font-size: 14px; margin: 0 0 10px; }
+
+/* Course + mobilité */
+.counters { display: flex; gap: 22px; }
+.day { position: relative; }
+.day.run::after { content: ""; position: absolute; bottom: -7px; left: 50%; width: 6px; height: 6px; margin-left: -3px; border-radius: 50%; background: var(--ok); }
+.kinds { margin-bottom: 12px; }
+.coach h3 { margin-bottom: 6px; }
+.coach p { margin: 0 0 6px; }
+.runform { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.runform label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+.runform input, .runform select { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px; font-size: 16px; color: var(--text); width: 100%; }
+.runform .dur { display: flex; align-items: center; gap: 4px; }
+.runform .dur span { color: var(--muted); }
+.pace { margin: 12px 0 0; font-size: 15px; }
+.pace:empty { display: none; }
+.warn { margin: 8px 0 0; padding: 8px 10px; border-radius: 10px; background: color-mix(in srgb, var(--accent) 14%, transparent); font-size: 14px; }

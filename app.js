@@ -7,9 +7,11 @@ function emptyState() {
   const levels = {};
   PROGRAM.exercises.forEach((ex) => (levels[ex.id] = 0));
   return {
-    settings: { weeklyGoal: PROGRAM.weeklyGoalDefault },
+    settings: { weeklyGoal: PROGRAM.weeklyGoalDefault, runGoal: PROGRAM.run.weeklyGoalDefault, kind: "cali" },
     levels,
     sessions: [],
+    runs: [], // { date, km, sec, rpe, mobility: [ids] }
+    runDraft: { checks: {} },
     weights: [],
     levelLog: [],
     proposals: [], // exos prêts pour le palier suivant, en attente de ta réponse
@@ -23,6 +25,7 @@ function load() {
     const raw = localStorage.getItem(KEY);
     if (!raw) return emptyState();
     const s = Object.assign(emptyState(), JSON.parse(raw));
+    s.settings = Object.assign(emptyState().settings, s.settings);
     PROGRAM.exercises.forEach((ex) => {
       if (typeof s.levels[ex.id] !== "number") s.levels[ex.id] = 0;
       s.levels[ex.id] = Math.min(s.levels[ex.id], ex.ladder.length - 1);
@@ -177,30 +180,53 @@ function hasSetData(d) {
 }
 
 // ---------- Rendu : Séance ----------
+// Deux compteurs séparés : calisthénie (pastille pleine) et course (point sous le jour).
 function renderWeek() {
   const monday = mondayOf(today());
   const done = sessionDates();
+  const ran = new Set(state.runs.map((r) => r.date));
   const goal = state.settings.weeklyGoal;
+  const runGoal = state.settings.runGoal;
   const count = sessionsInWeek(monday).length;
+  const runCount = runsInWeek(monday).length;
   const days = ["L", "M", "M", "J", "V", "S", "D"];
   const dots = days
     .map((l, i) => {
       const d = addDays(monday, i);
-      const cls = [done.has(d) ? "done" : "", d === today() ? "today" : ""].join(" ");
+      const cls = [done.has(d) ? "done" : "", ran.has(d) ? "run" : "", d === today() ? "today" : ""].join(" ");
       return `<div class="day ${cls}"><span>${l}</span></div>`;
     })
     .join("");
   const streak = weeksStreak();
+  const both = count >= goal && runCount >= runGoal;
   return `
     <section class="card week">
       <div class="week-head">
-        <div><div class="big">${count}<small>/${goal}</small></div><div class="muted">séances cette semaine</div></div>
+        <div class="counters">
+          <div><div class="big">${count}<small>/${goal}</small></div><div class="muted small">🏋️ calisthénie</div></div>
+          <div><div class="big">${runCount}<small>/${runGoal}</small></div><div class="muted small">🏃 course</div></div>
+        </div>
         <div class="streak">${streak > 0 ? `🔥 ${streak} sem.` : ""}</div>
       </div>
       <div class="days">${dots}</div>
-      ${count >= goal ? `<p class="win">Objectif de la semaine atteint 💪</p>` : ""}
+      ${both ? `<p class="win">Semaine complète, cali et course 💪</p>` : count >= goal ? `<p class="win">Objectif calisthénie atteint 💪</p>` : ""}
     </section>`;
 }
+
+function kindSwitch() {
+  const k = state.settings.kind;
+  return `<div class="seg kinds">
+    <button data-kind="cali" class="${k === "cali" ? "on" : ""}">🏋️ Calisthénie</button>
+    <button data-kind="run" class="${k === "run" ? "on" : ""}">🏃 Course + mobilité</button>
+  </div>`;
+}
+document.addEventListener("click", (e) => {
+  const b = e.target.closest && e.target.closest("[data-kind]");
+  if (!b) return;
+  state.settings.kind = b.dataset.kind;
+  save();
+  renderSession();
+});
 
 function checkItem(key, label) {
   const d = getDraft();
@@ -308,6 +334,7 @@ function sessionComplete() {
 }
 
 function renderSession() {
+  if (state.settings.kind === "run") return renderRun();
   const view = $("#view");
   const t = today();
   const doneToday = state.sessions.find((s) => s.date === t);
@@ -316,6 +343,7 @@ function renderSession() {
     const trainedYesterday = state.sessions.some((s) => s.date === addDays(t, -1));
     view.innerHTML =
       renderWeek() +
+      kindSwitch() +
       proposalCards() +
       exportBanner() +
       `<section class="card center">
@@ -336,6 +364,7 @@ function renderSession() {
   const trainedDayBefore = state.sessions.some((s) => s.date === addDays(d.date, -1));
   view.innerHTML =
     renderWeek() +
+    kindSwitch() +
     proposalCards() +
     exportBanner() +
     `<section class="card">
@@ -615,6 +644,199 @@ function reopenSession(s) {
   window.scrollTo(0, 0);
 }
 
+// ---------- Course + mobilité ----------
+const RUN = PROGRAM.run;
+function runsInWeek(monday) {
+  const end = addDays(monday, 7);
+  return state.runs.filter((r) => r.date >= monday && r.date < end);
+}
+function fmtKm(km) {
+  return String(parseFloat(km.toFixed(2))).replace(".", ",");
+}
+function fmtPace(secPerKm) {
+  const s = Math.round(secPerKm);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+function paceOf(r) {
+  return r.sec / r.km;
+}
+function longest(runs) {
+  return runs.length ? Math.max(...runs.map((r) => r.km)) : 0;
+}
+
+// Blocs de RUN.blockDays jours depuis RUN.blockStart (les blocs d'avant ont un numéro négatif).
+function blockOf(date) {
+  return Math.floor((dayNum(date) - dayNum(RUN.blockStart)) / RUN.blockDays);
+}
+function blockRange(b) {
+  const start = addDays(RUN.blockStart, b * RUN.blockDays);
+  return [start, addDays(start, RUN.blockDays - 1)];
+}
+function runsBetween(from, to, exceptDate) {
+  return state.runs.filter((r) => r.date >= from && r.date <= to && r.date !== exceptDate);
+}
+
+// Limite d'une sortie à la date donnée : growth × plus longue sortie du bloc précédent, plafonnée.
+// Bloc précédent vide : pas de hausse, on reprend la plus longue des 4 semaines d'avant.
+function runLimit(date) {
+  // Avant le démarrage du plan, on affiche déjà la limite du premier bloc.
+  const b = Math.max(0, blockOf(date));
+  const [start, end] = blockRange(b);
+  const [ps, pe] = blockRange(b - 1);
+  const prev = longest(runsBetween(ps, pe));
+  let km, base, hold = false;
+  if (prev) {
+    base = prev;
+    km = prev * RUN.growth;
+  } else {
+    base = longest(runsBetween(addDays(start, -28), addDays(start, -1)));
+    if (!base) return null;
+    km = base;
+    hold = true;
+  }
+  km = Math.min(RUN.capKm, Math.round(km * 10) / 10);
+  return { km, base, hold, start, end, capped: km >= RUN.capKm };
+}
+
+// Alertes du coach pour une sortie (date, km, sec/km) avant enregistrement.
+function runWarnings(date, km, pace) {
+  const w = [];
+  const lim = date >= RUN.blockStart ? runLimit(date) : null; // sorties d'avant le plan : pas de limite
+  if (lim && km > lim.km + 0.05) w.push(`Au-dessus de ta limite du bloc : ${fmtKm(lim.km)} km max.`);
+  const recent = runsBetween(addDays(date, -14), addDays(date, -1), date);
+  const month = runsBetween(addDays(date, -30), addDays(date, -1), date);
+  if (recent.length && month.length && km > longest(recent) && pace < Math.min(...month.map(paceOf)))
+    w.push("Distance ET vitesse en hausse en même temps : une seule à la fois.");
+  return w;
+}
+
+function coachCard() {
+  const t = today();
+  const lim = runLimit(t);
+  if (!lim)
+    return `<section class="card banner coach"><h3>🎯 Coach course</h3>
+      <p class="small">Pas encore de repère. Enregistre ta dernière sortie, même ancienne (choisis sa date) : l'app calculera ta limite.</p></section>`;
+  const [bs, be] = [lim.start, lim.end];
+  const thisBlock = longest(runsBetween(bs, be));
+  const nextStart = addDays(be, 1);
+  return `<section class="card banner coach">
+    <h3>🎯 Limite : ${fmtKm(lim.km)} km par sortie</h3>
+    <p class="small">Bloc du ${prettyDate(bs)} au ${prettyDate(be)} · ${
+      lim.capped
+        ? `plafond de ${RUN.capKm} km atteint, garde ce volume`
+        : lim.hold
+        ? `pas de sortie au bloc précédent : pas de hausse, on reprend ${fmtKm(lim.base)} km`
+        : `ta plus longue du bloc précédent (${fmtKm(lim.base)} km) × ${String(RUN.growth).replace(".", ",")}`
+    }</p>
+    <p class="small">Plus longue ce bloc : <b>${thisBlock ? fmtKm(thisBlock) + " km" : "aucune"}</b>${
+      lim.capped ? "" : ` · prochaine hausse possible le ${prettyDate(nextStart)}`
+    }</p>
+    <p class="muted small">Allure où tu peux parler. Une seule chose augmente à la fois : distance OU vitesse. Douleur au tibia, genou ou tendon d'Achille : tu restes sur place.</p>
+  </section>`;
+}
+
+function renderRun() {
+  const view = $("#view");
+  const t = today();
+  const d = state.runDraft;
+  const todayRun = state.runs.find((r) => r.date === t);
+  const recent = [...state.runs]
+    .reverse()
+    .slice(0, 5)
+    .map(
+      (r) => `<div class="hist"><span>${prettyDate(r.date)}</span><span class="grow"><b>${fmtKm(r.km)} km</b> · ${fmtPace(paceOf(r))}/km${
+        r.rpe != null ? ` · effort ${r.rpe}/10` : ""
+      }</span><button class="x" data-delrun="${r.date}" aria-label="Supprimer">×</button></div>`
+    )
+    .join("");
+
+  view.innerHTML =
+    renderWeek() +
+    kindSwitch() +
+    exportBanner() +
+    coachCard() +
+    (todayRun
+      ? `<section class="card center"><div class="huge">✅</div><h2>Sortie enregistrée</h2>
+          <p class="muted">${fmtKm(todayRun.km)} km · ${fmtPace(paceOf(todayRun))}/km. Pense à la mobilité si ce n'est pas fait.</p></section>`
+      : "") +
+    `<section class="card">
+      <h3>1. Ta sortie</h3>
+      <div class="runform">
+        <label>Date<input type="date" id="rdate" value="${t}"></label>
+        <label>Distance (km)<input type="text" inputmode="decimal" id="rkm" placeholder="4,5"></label>
+        <label>Durée<span class="dur"><input type="number" inputmode="numeric" id="rmin" placeholder="min" min="0"><span>:</span><input type="number" inputmode="numeric" id="rsec" placeholder="s" min="0" max="59"></span></label>
+        <label>Effort ressenti (optionnel)<select id="rrpe"><option value="">—</option>${Array.from({ length: 11 }, (_, i) => `<option value="${i}">${i}${i === 0 ? " (repos)" : i === 10 ? " (max)" : ""}</option>`).join("")}</select></label>
+      </div>
+      <p class="pace" id="rpace"></p>
+      <div id="rwarn"></div>
+    </section>
+    <section class="card">
+      <h3>2. Mobilité après la course <span class="muted small">· ~15 min</span></h3>
+      <p class="muted small">Après la course, jamais juste avant une séance de calisthénie.</p>
+      ${RUN.mobility
+        .map(
+          (m) => `<label class="check ${d.checks[m.id] ? "on" : ""}"><input type="checkbox" data-mob="${m.id}" ${d.checks[m.id] ? "checked" : ""}>
+            <span class="box"></span><span>${esc(m.text)}</span></label>`
+        )
+        .join("")}
+    </section>
+    <button class="primary" id="saverun">Enregistrer la sortie</button>
+    <section class="card"><h3>Dernières sorties</h3>${recent || `<p class="muted small">Pas encore de sortie.</p>`}</section>`;
+
+  const readForm = () => {
+    const km = parseFloat($("#rkm").value.replace(",", "."));
+    const sec = (parseInt($("#rmin").value, 10) || 0) * 60 + (parseInt($("#rsec").value, 10) || 0);
+    return { date: $("#rdate").value || t, km, sec };
+  };
+  const refresh = () => {
+    const { date, km, sec } = readForm();
+    const ok = km > 0 && sec > 0;
+    $("#rpace").innerHTML = ok ? `Allure : <b>${fmtPace(sec / km)}/km</b>` : "";
+    const w = km > 0 ? runWarnings(date, km, ok ? sec / km : Infinity) : [];
+    $("#rwarn").innerHTML = w.map((x) => `<p class="warn">⚠️ ${esc(x)}</p>`).join("");
+  };
+  ["#rdate", "#rkm", "#rmin", "#rsec"].forEach((s) => $(s).addEventListener("input", refresh));
+
+  view.querySelectorAll("[data-mob]").forEach((c) =>
+    c.addEventListener("change", () => {
+      state.runDraft.checks[c.dataset.mob] = c.checked;
+      save();
+      c.closest(".check").classList.toggle("on", c.checked);
+    })
+  );
+  $("#saverun").addEventListener("click", () => {
+    const { date, km, sec } = readForm();
+    if (!(km > 0 && km < 100)) return toast("Distance invalide");
+    if (!(sec > 0)) return toast("Durée manquante");
+    const w = runWarnings(date, km, sec / km);
+    if (w.length && !confirm(`${w.join("\n")}\n\nEnregistrer quand même ?`)) return;
+    if (state.runs.some((r) => r.date === date) && !confirm(`Remplacer la sortie du ${prettyDate(date)} ?`)) return;
+    const rpe = $("#rrpe").value;
+    const prevBest = longest(state.runs);
+    state.runs = state.runs.filter((r) => r.date !== date);
+    state.runs.push({
+      date,
+      km: Math.round(km * 100) / 100,
+      sec,
+      rpe: rpe === "" ? null : +rpe,
+      mobility: Object.keys(state.runDraft.checks).filter((k) => state.runDraft.checks[k]),
+    });
+    state.runs.sort((a, b) => a.date.localeCompare(b.date));
+    state.runDraft = { checks: {} };
+    save();
+    renderRun();
+    toast(prevBest && km > prevBest ? `🏅 Record de distance : ${fmtKm(km)} km` : "Sortie enregistrée 🏃");
+  });
+  view.querySelectorAll("[data-delrun]").forEach((b) =>
+    b.addEventListener("click", () => {
+      if (!confirm("Supprimer cette sortie ?")) return;
+      state.runs = state.runs.filter((r) => r.date !== b.dataset.delrun);
+      save();
+      renderRun();
+    })
+  );
+}
+
 // ---------- Minuteur de repos ----------
 // Calé sur l'heure de fin : reste juste même si le téléphone met la page en veille.
 let restTimer = null;
@@ -660,7 +882,7 @@ function niceScale(lo, hi, integer) {
 
 // Courbe SVG d'une seule série. points : [{ date, y, seg, tip }]. La ligne se coupe à chaque
 // changement de `seg` (nouveau palier) avec un repère vertical étiqueté par labels[seg].
-function lineChart(points, { from0 = false, integer = true, labels = {} } = {}) {
+function lineChart(points, { from0 = false, integer = true, labels = {}, fmtY = null } = {}) {
   const W = 320, H = 150, L = 34, R = 12, T = 20, B = 22;
   const xs = points.map((p) => dayNum(p.date));
   const ys = points.map((p) => p.y);
@@ -669,7 +891,7 @@ function lineChart(points, { from0 = false, integer = true, labels = {} } = {}) 
   const sc = niceScale(from0 ? 0 : Math.min(...ys), Math.max(...ys), integer);
   const sx = (x) => L + ((x - x0) / (x1 - x0)) * (W - L - R);
   const sy = (y) => T + (1 - (y - sc.lo) / (sc.hi - sc.lo)) * (H - T - B);
-  const fmt = (v) => (Number.isInteger(v) ? v : v.toFixed(1));
+  const fmt = fmtY || ((v) => (Number.isInteger(v) ? v : v.toFixed(1)));
 
   let svg = "";
   for (let v = sc.lo; v <= sc.hi + sc.step / 2; v += sc.step) {
@@ -756,7 +978,32 @@ function milestones() {
         ev.push({ date: state.transitions[ex.id], icon: "🔀", text: `Transition commencée : ${label}` });
     })
   );
+  // Course : première sortie, puis chaque record de distance
+  let best = 0;
+  state.runs.forEach((r, i) => {
+    if (i === 0) ev.push({ date: r.date, icon: "🏃", text: `Première sortie enregistrée : ${fmtKm(r.km)} km` });
+    else if (r.km > best) ev.push({ date: r.date, icon: "🏅", text: `Record de distance : ${fmtKm(r.km)} km` });
+    best = Math.max(best, r.km);
+  });
   return ev.sort((a, b) => b.date.localeCompare(a.date));
+}
+
+// Carte course de l'onglet Progrès : distance et allure par sortie.
+function runProgressCard() {
+  if (!state.runs.length) return "";
+  const pts = (y, tip) => state.runs.map((r) => ({ date: r.date, y: y(r), seg: "r", tip: tip(r) }));
+  const tip = (r) => `${prettyDate(r.date)} · ${fmtKm(r.km)} km · ${fmtPace(paceOf(r))}/km`;
+  const lim = runLimit(today());
+  return `<section class="card">
+    <h3>🏃 Course</h3>
+    <p class="small">${lim ? `Limite actuelle : <b>${fmtKm(lim.km)} km</b> par sortie · ` : ""}plus longue : <b>${fmtKm(longest(state.runs))} km</b> · plafond ${RUN.capKm} km</p>
+    ${
+      state.runs.length > 1
+        ? `<p class="muted small chart-title">Distance par sortie (km)</p>${lineChart(pts((r) => r.km, tip), { from0: true, integer: false })}
+           <p class="muted small chart-title">Allure (min/km) · plus bas = plus rapide</p>${lineChart(pts((r) => paceOf(r) / 60, tip), { integer: false, fmtY: (v) => fmtPace(v * 60) })}`
+        : `<p class="muted small">Les courbes apparaissent dès la 2e sortie.</p>`
+    }
+  </section>`;
 }
 
 // ---------- Rendu : Progrès ----------
@@ -810,6 +1057,7 @@ function renderProgress() {
   view.innerHTML =
     `<p class="muted small pad">Quand tu fais le max sur les ${PROGRAM.rounds} tours, ${PROGRAM.advanceAfter} séances de suite, l'app te propose le palier suivant : direct ou progressivement. C'est toi qui décides. Les boutons − / + ajustent à la main.</p>` +
     `<section class="card"><h3>🏅 Journal</h3>${journal || `<p class="muted small">Tes premières fois apparaîtront ici.</p>`}</section>` +
+    runProgressCard() +
     cards;
 
   view.querySelectorAll("[data-up]").forEach((b) =>
@@ -852,23 +1100,42 @@ function sessionLines(s) {
 
 function renderHistory() {
   const view = $("#view");
-  if (!state.sessions.length) {
+  if (!state.sessions.length && !state.runs.length) {
     view.innerHTML = `<section class="card"><p class="muted small">Rien pour l'instant. La première, c'est la plus dure.</p></section>`;
     return;
   }
-  const items = state.sessions
-    .map((s, i) => ({ s, i }))
-    .reverse()
-    .map(({ s, i }, n) => {
+  const mobText = (id) => (RUN.mobility.find((m) => m.id === id) || { text: id }).text;
+  const entries = [
+    ...state.sessions.map((s, i) => ({ date: s.date, kind: 0, s, i })),
+    ...state.runs.map((r) => ({ date: r.date, kind: 1, r })),
+  ].sort((a, b) => b.date.localeCompare(a.date) || b.kind - a.kind);
+  const items = entries
+    .map((e, n) => {
+      if (e.r) {
+        const r = e.r;
+        return `<details class="card sess" ${n === 0 ? "open" : ""}>
+          <summary><span>${prettyDate(r.date)}</span><span class="muted">🏃 course</span><b>${fmtKm(r.km)} km</b></summary>
+          <div class="sess-body">
+            <div class="hist"><span class="grow">Allure</span><b>${fmtPace(paceOf(r))}/km</b></div>
+            <div class="hist"><span class="grow">Durée</span><b>${fmtPace(r.sec)}</b></div>
+            ${r.rpe != null ? `<div class="hist"><span class="grow">Effort ressenti</span><b>${r.rpe}/10</b></div>` : ""}
+            <div class="hist"><span class="grow">Mobilité</span><b>${(r.mobility || []).length}/${RUN.mobility.length}</b></div>
+            ${(r.mobility || []).map((id) => `<p class="muted small">✓ ${esc(mobText(id))}</p>`).join("")}
+          </div>
+        </details>`;
+      }
+      const s = e.s;
       return `<details class="card sess" ${n === 0 ? "open" : ""}>
         <summary><span>${prettyDate(s.date)}</span><span class="muted">${s.mode === "maison" ? "🏠 maison" : "🌳 parc"}</span><b class="${s.complete ? "ok" : ""}">${s.complete ? "✓ complète" : "partielle"}</b></summary>
         <div class="sess-body">${sessionLines(s)}
-          <button class="ghost danger small" data-delsess="${i}">Supprimer cette séance</button></div>
+          <button class="ghost danger small" data-delsess="${e.i}">Supprimer cette séance</button></div>
       </details>`;
     })
     .join("");
 
-  view.innerHTML = `<p class="muted small pad">${state.sessions.length} séance${state.sessions.length > 1 ? "s" : ""} · touche une séance pour voir le détail.</p>` + items;
+  const nS = state.sessions.length, nR = state.runs.length;
+  view.innerHTML =
+    `<p class="muted small pad">${nS} séance${nS > 1 ? "s" : ""} · ${nR} sortie${nR > 1 ? "s" : ""} · touche une ligne pour voir le détail.</p>` + items;
 
   view.querySelectorAll("[data-delsess]").forEach((b) =>
     b.addEventListener("click", () => {
@@ -957,7 +1224,10 @@ function renderSettings() {
   view.innerHTML = `
     <section class="card">
       <h3>Objectif par semaine</h3>
+      <p class="muted small">🏋️ Calisthénie</p>
       <div class="seg">${[3, 4, 5].map((n) => `<button data-goal="${n}" class="${goal === n ? "on" : ""}">${n} séances</button>`).join("")}</div>
+      <p class="muted small">🏃 Course + mobilité</p>
+      <div class="seg">${[1, 2, 3].map((n) => `<button data-rungoal="${n}" class="${state.settings.runGoal === n ? "on" : ""}">${n} sortie${n > 1 ? "s" : ""}</button>`).join("")}</div>
     </section>
     <section class="card">
       <h3>Rappel</h3>
@@ -981,6 +1251,13 @@ function renderSettings() {
   view.querySelectorAll("[data-goal]").forEach((b) =>
     b.addEventListener("click", () => {
       state.settings.weeklyGoal = +b.dataset.goal;
+      save();
+      renderSettings();
+    })
+  );
+  view.querySelectorAll("[data-rungoal]").forEach((b) =>
+    b.addEventListener("click", () => {
+      state.settings.runGoal = +b.dataset.rungoal;
       save();
       renderSettings();
     })
@@ -1023,7 +1300,7 @@ function exportData() {
 }
 // Rappel d'export dès qu'il y a quelque chose à perdre et que le dernier date d'un mois.
 function exportBanner() {
-  if (state.sessions.length < 3) return "";
+  if (state.sessions.length + state.runs.length < 3) return "";
   const last = state.settings.lastExport;
   const days = last ? dayNum(today()) - dayNum(last) : null;
   if (days !== null && days < EXPORT_EVERY) return "";
