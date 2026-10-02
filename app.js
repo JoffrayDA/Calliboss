@@ -3,11 +3,41 @@
 // ---------- Stockage ----------
 const KEY = "calliboss.v1";
 
+function clone(o) {
+  return JSON.parse(JSON.stringify(o));
+}
+
+// Le programme de program.js sert de base. Un programme créé dans l'app (state.program)
+// le remplace en écrasant ces clés de PROGRAM ; la partie course n'est pas concernée.
+const DEFAULT_PROGRAM = clone(PROGRAM);
+const PROGRAM_KEYS = ["name", "rounds", "restBetweenRounds", "warmup", "mobility", "cooldown", "exercises"];
+function applyProgram(p) {
+  const src = p || DEFAULT_PROGRAM;
+  PROGRAM_KEYS.forEach((k) => (PROGRAM[k] = clone(src[k] !== undefined ? src[k] : DEFAULT_PROGRAM[k])));
+}
+
+// Chaque ligne de séance garde le nom et l'unité du mouvement fait ce jour-là :
+// l'historique reste lisible quand le programme change.
+function stampNames(s) {
+  s.sessions.forEach((se) =>
+    Object.keys(se.results || {}).forEach((id) => {
+      const ex = PROGRAM.exercises.find((e) => e.id === id);
+      const r = se.results[id];
+      [r, ...(r.extras || [])].forEach((e) => {
+        if (e.name) return;
+        const st = ex && e.level >= 0 ? stepFor(ex, e.level, e.home) : null;
+        e.name = st ? st.name : id;
+        e.unit = st ? st.unit : "reps";
+      });
+    })
+  );
+}
+
 function emptyState() {
   const levels = {};
   PROGRAM.exercises.forEach((ex) => (levels[ex.id] = 0));
   return {
-    settings: { weeklyGoal: PROGRAM.weeklyGoalDefault, runGoal: PROGRAM.run.weeklyGoalDefault, kind: "cali" },
+    settings: { weeklyGoal: PROGRAM.weeklyGoalDefault, runGoal: PROGRAM.run.weeklyGoalDefault, kind: "cali", shareWeight: true },
     levels,
     sessions: [],
     runs: [], // { date, km, sec, rpe, mobility: [ids] }
@@ -17,21 +47,28 @@ function emptyState() {
     proposals: [], // exos prêts pour le palier suivant, en attente de ta réponse
     transitions: {}, // exId -> date de début : le palier suivant est ajouté en « palier en plus »
     draft: null,
+    program: null, // programme créé dans l'app ; null = programme de base
   };
 }
 
 function load() {
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return emptyState();
+    if (!raw) {
+      applyProgram(null);
+      return emptyState();
+    }
     const s = Object.assign(emptyState(), JSON.parse(raw));
     s.settings = Object.assign(emptyState().settings, s.settings);
+    applyProgram(s.program);
     PROGRAM.exercises.forEach((ex) => {
       if (typeof s.levels[ex.id] !== "number") s.levels[ex.id] = 0;
       s.levels[ex.id] = Math.min(s.levels[ex.id], ex.ladder.length - 1);
     });
+    stampNames(s);
     return s;
   } catch (e) {
+    applyProgram(null);
     return emptyState();
   }
 }
@@ -42,6 +79,7 @@ function save() {
   } catch (e) {
     toast("Impossible d'enregistrer les données");
   }
+  schedulePublish();
 }
 
 let state = load();
@@ -94,7 +132,7 @@ function unitLabel(u) {
 // Palier d'un exercice, variante maison si demandée et disponible.
 // Le niveau est borné pour survivre à une échelle raccourcie dans program.js.
 function stepFor(ex, level, home) {
-  const step = ex.ladder[Math.min(level, ex.ladder.length - 1)];
+  const step = ex.ladder[Math.max(0, Math.min(level, ex.ladder.length - 1))];
   if (home && step.home) return { ...step.home, isHome: true };
   return { ...step, isHome: false };
 }
@@ -181,26 +219,21 @@ function hasSetData(d) {
 
 // ---------- Rendu : Séance ----------
 // Deux compteurs séparés : calisthénie (pastille pleine) et course (point sous le jour).
-function renderWeek() {
+// Semaine en cours de n'importe qui (moi ou un membre du groupe) : `done` et `ran` sont
+// les dates (Set) des séances de calisthénie et des sorties.
+function weekHtml(done, ran, goal, runGoal, streak) {
   const monday = mondayOf(today());
-  const done = sessionDates();
-  const ran = new Set(state.runs.map((r) => r.date));
-  const goal = state.settings.weeklyGoal;
-  const runGoal = state.settings.runGoal;
-  const count = sessionsInWeek(monday).length;
-  const runCount = runsInWeek(monday).length;
-  const days = ["L", "M", "M", "J", "V", "S", "D"];
-  const dots = days
+  let count = 0, runCount = 0;
+  const dots = ["L", "M", "M", "J", "V", "S", "D"]
     .map((l, i) => {
       const d = addDays(monday, i);
+      if (done.has(d)) count++;
+      if (ran.has(d)) runCount++;
       const cls = [done.has(d) ? "done" : "", ran.has(d) ? "run" : "", d === today() ? "today" : ""].join(" ");
       return `<div class="day ${cls}"><span>${l}</span></div>`;
     })
     .join("");
-  const streak = weeksStreak();
-  const both = count >= goal && runCount >= runGoal;
-  return `
-    <section class="card week">
+  const html = `
       <div class="week-head">
         <div class="counters">
           <div><div class="big">${count}<small>/${goal}</small></div><div class="muted small">🏋️ calisthénie</div></div>
@@ -208,7 +241,17 @@ function renderWeek() {
         </div>
         <div class="streak">${streak > 0 ? `🔥 ${streak} sem.` : ""}</div>
       </div>
-      <div class="days">${dots}</div>
+      <div class="days">${dots}</div>`;
+  return { html, count, runCount };
+}
+
+function renderWeek() {
+  const goal = state.settings.weeklyGoal;
+  const runGoal = state.settings.runGoal;
+  const { html, count, runCount } = weekHtml(sessionDates(), new Set(state.runs.map((r) => r.date)), goal, runGoal, weeksStreak());
+  const both = count >= goal && runCount >= runGoal;
+  return `
+    <section class="card week">${html}
       ${both ? `<p class="win">Semaine complète, cali et course 💪</p>` : count >= goal ? `<p class="win">Objectif calisthénie atteint 💪</p>` : ""}
     </section>`;
 }
@@ -383,8 +426,8 @@ function renderSession() {
     </section>
 
     <section class="card">
-      <h3>2. Circuit · ${PROGRAM.rounds} tours</h3>
-      <p class="muted small">Enchaîne les exos dans l'ordre, puis recommence. ${esc(PROGRAM.restBetweenRounds)}. Note ce que tu fais à chaque tour (T1, T2, T3).</p>
+      <h3>2. Circuit · ${PROGRAM.rounds} tour${PROGRAM.rounds > 1 ? "s" : ""}</h3>
+      <p class="muted small">Enchaîne les exos dans l'ordre, puis recommence. ${esc(PROGRAM.restBetweenRounds)}. Note ce que tu fais à chaque tour (${Array.from({ length: PROGRAM.rounds }, (_, i) => `T${i + 1}`).join(", ")}).</p>
       ${PROGRAM.exercises.map(exerciseCard).join("")}
       <button class="ghost" id="rest">⏱ Repos 2:00</button>
     </section>
@@ -494,10 +537,14 @@ function validateSession() {
   const results = {};
   PROGRAM.exercises.forEach((ex) => {
     const lvl = state.levels[ex.id];
+    const named = (level, home) => {
+      const st = stepFor(ex, level, home);
+      return { level, home: st.isHome, name: st.name, unit: st.unit };
+    };
     const extras = (d.extras[ex.id] || [])
-      .map((x) => ({ level: x.level, home: x.home, sets: dense(x.sets) }))
+      .map((x) => ({ ...named(x.level, x.home), sets: dense(x.sets) }))
       .filter((x) => countFilled(x.sets) > 0);
-    results[ex.id] = { level: lvl, home: stepFor(ex, lvl, d.mode === "maison").isHome, sets: dense(d.sets[ex.id]), extras };
+    results[ex.id] = { ...named(lvl, d.mode === "maison"), sets: dense(d.sets[ex.id]), extras };
   });
   const bonus = d.bonus.map((b) => ({ name: b.name, unit: b.unit, sets: dense(b.sets) })).filter((b) => countFilled(b.sets) > 0);
   state.sessions.push({ date: d.date, mode: d.mode, complete, checks: { ...d.checks }, results, bonus });
@@ -631,9 +678,10 @@ function reopenSession(s) {
   PROGRAM.exercises.forEach((ex) => {
     const r = s.results[ex.id];
     if (!r) return;
-    state.levels[ex.id] = Math.min(r.level, ex.ladder.length - 1);
+    // level < 0 : palier retiré du programme depuis, on garde le palier actuel
+    if (r.level >= 0) state.levels[ex.id] = Math.min(r.level, ex.ladder.length - 1);
     d.sets[ex.id] = [...r.sets];
-    d.extras[ex.id] = (r.extras || []).map((x) => ({ ...x, sets: [...x.sets] }));
+    d.extras[ex.id] = (r.extras || []).filter((x) => x.level >= 0).map((x) => ({ level: x.level, home: x.home, sets: [...x.sets] }));
   });
   state.levelLog = state.levelLog.filter((l) => l.date !== s.date);
   state.proposals = [];
@@ -941,19 +989,21 @@ function exerciseChart(ex) {
     .filter((s) => s.results[ex.id] && countFilled(s.results[ex.id].sets) > 0)
     .map((s) => {
       const r = s.results[ex.id];
-      const st = stepFor(ex, r.level, r.home);
-      const sets = dense(r.sets);
+      const sets = r.sets;
       const total = sets.reduce((a, b) => a + b, 0);
       return {
         date: s.date,
         y: total,
         seg: `${r.level}${r.home ? "h" : ""}`,
-        tip: `${prettyDate(s.date)} · ${st.name} · ${sets.join("·")} = ${total} ${unitLabel(st.unit)}`,
+        tip: `${prettyDate(s.date)} · ${r.name} · ${sets.join("·")} = ${total} ${unitLabel(r.unit)}`,
       };
     });
   if (points.length < 2) return "";
   const labels = {};
-  points.forEach((p) => (labels[p.seg] = `P${parseInt(p.seg, 10) + 1}${p.seg.endsWith("h") ? " maison" : ""}`));
+  points.forEach((p) => {
+    const lvl = parseInt(p.seg, 10);
+    labels[p.seg] = lvl < 0 ? "ancien" : `P${lvl + 1}${p.seg.endsWith("h") ? " maison" : ""}`;
+  });
   const unit = unitLabel(ex.ladder[0].unit);
   return `<p class="muted small chart-title">Total par séance (${unit}), palier principal</p>` + lineChart(points, { from0: true, labels });
 }
@@ -1025,7 +1075,7 @@ function renderProgress() {
         })
         .slice(-4)
         .reverse()
-        .map(({ date, e }) => `<div class="hist"><span>${prettyDate(date)}</span><span class="muted">${esc(stepFor(ex, e.level, e.home).name)}</span><b>${dense(e.sets).join(" · ")}</b></div>`)
+        .map(({ date, e }) => `<div class="hist"><span>${prettyDate(date)}</span><span class="muted">${esc(e.name)}</span><b>${e.sets.join(" · ")}</b></div>`)
         .join("");
       return `<section class="card">
         <div class="ex-head"><h3>${esc(ex.name)}</h3>
@@ -1081,21 +1131,33 @@ function renderProgress() {
 
 // ---------- Rendu : Historique ----------
 // Détail d'une séance : une ligne par palier travaillé, puis les bonus.
-function sessionLines(s) {
-  const line = (name, sets, unit, tag) =>
-    `<div class="hist"><span class="grow">${esc(name)}${tag ? ` <span class="tag">${tag}</span>` : ""}</span><b>${dense(sets).join(" · ")} <small class="muted">${unitLabel(unit)}</small></b></div>`;
-  const lines = PROGRAM.exercises.flatMap((ex) => {
-    const r = s.results[ex.id];
+// Sous forme de données ({ name, unit, sets, tag }) : c'est aussi ce qui est partagé au groupe.
+function sessionEntries(s) {
+  // Exos du programme actuel d'abord, puis ceux retirés depuis.
+  const ids = PROGRAM.exercises.map((ex) => ex.id);
+  Object.keys(s.results).forEach((id) => ids.includes(id) || ids.push(id));
+  const entries = ids.flatMap((id) => {
+    const r = s.results[id];
     if (!r) return [];
     return [r, ...(r.extras || [])]
       .filter((e) => countFilled(e.sets) > 0)
-      .map((e) => {
-        const st = stepFor(ex, e.level, e.home);
-        return line(st.name, e.sets, st.unit, e.home ? "maison" : "");
-      });
+      .map((e) => ({ name: e.name, unit: e.unit, sets: e.sets, tag: e.home ? "maison" : "" }));
   });
-  (s.bonus || []).forEach((b) => lines.push(line(b.name, b.sets, b.unit, "bonus")));
-  return lines.join("") || `<p class="muted small">Aucune série notée.</p>`;
+  (s.bonus || []).forEach((b) => entries.push({ name: b.name, unit: b.unit, sets: b.sets, tag: "bonus" }));
+  return entries;
+}
+function entryLines(entries) {
+  return (
+    entries
+      .map(
+        (e) =>
+          `<div class="hist"><span class="grow">${esc(e.name)}${e.tag ? ` <span class="tag">${esc(e.tag)}</span>` : ""}</span><b>${(e.sets || []).map(Number).join(" · ")} <small class="muted">${unitLabel(e.unit)}</small></b></div>`
+      )
+      .join("") || `<p class="muted small">Aucune série notée.</p>`
+  );
+}
+function sessionLines(s) {
+  return entryLines(sessionEntries(s));
 }
 
 function renderHistory() {
@@ -1244,9 +1306,12 @@ function renderSettings() {
     </section>
     <section class="card">
       <h3>Programme</h3>
-      <p class="muted small">${esc(PROGRAM.name)} · ${PROGRAM.exercises.map((e) => esc(e.name)).join(", ")}. Modifiable dans <code>program.js</code>.</p>
+      <p class="muted small">${esc(PROGRAM.name)}${state.program ? " (perso)" : ""} · ${PROGRAM.exercises.map((e) => esc(e.name)).join(", ")}.</p>
+      <button class="ghost" id="editprog">✏️ Créer / modifier mon programme</button>
       <button class="ghost danger" id="reset">Tout effacer</button>
     </section>`;
+
+  $("#editprog").addEventListener("click", openProgramEditor);
 
   view.querySelectorAll("[data-goal]").forEach((b) =>
     b.addEventListener("click", () => {
@@ -1278,12 +1343,229 @@ function renderSettings() {
     }
   });
   $("#reset").addEventListener("click", () => {
-    if (!confirm("Effacer TOUTES les données (séances, paliers, poids) ?")) return;
+    if (!confirm("Effacer TOUTES les données (séances, paliers, poids, programme perso) ?")) return;
+    applyProgram(null);
     state = emptyState();
     save();
     toast("Données effacées");
     renderSettings();
   });
+}
+
+// ---------- Éditeur de programme ----------
+// Copie de travail du programme : rien n'est appliqué avant « Enregistrer ».
+// `_from` retient l'ancien rang de chaque palier pour recaler les niveaux et l'historique.
+let progEdit = null;
+function newStep() {
+  return { name: "", min: 5, max: 10, unit: "reps", tip: "" };
+}
+function openProgramEditor() {
+  progEdit = {};
+  PROGRAM_KEYS.forEach((k) => (progEdit[k] = clone(PROGRAM[k])));
+  progEdit.exercises.forEach((ex) => ex.ladder.forEach((st, i) => (st._from = i)));
+  renderProgramEditor();
+  window.scrollTo(0, 0);
+}
+
+function edField(path, value, { num = false, ph = "" } = {}) {
+  return `<input type="${num ? "number" : "text"}" ${num ? `inputmode="numeric" min="1" data-num` : ""} data-p="${path}" value="${esc(value == null ? "" : value)}" placeholder="${esc(ph)}" autocomplete="off">`;
+}
+function edStepFields(path, st) {
+  return `<div class="ed-grid">
+    ${edField(`${path}.name`, st.name, { ph: "Nom du mouvement" })}
+    <div class="ed-range">${edField(`${path}.min`, st.min, { num: true, ph: "min" })}<span>à</span>${edField(`${path}.max`, st.max, { num: true, ph: "max" })}
+      <select data-p="${path}.unit"><option value="reps" ${st.unit === "s" ? "" : "selected"}>reps</option><option value="s" ${st.unit === "s" ? "selected" : ""}>secondes</option></select></div>
+    ${edField(`${path}.tip`, st.tip, { ph: "Conseil (optionnel)" })}
+  </div>`;
+}
+function edButtons(kind, i, j, count) {
+  const at = `data-i="${i}"${j === null ? "" : ` data-j="${j}"`}`;
+  const pos = j === null ? i : j;
+  return `<div class="ed-btns">
+    <button data-act="${kind}up" ${at} ${pos === 0 ? "disabled" : ""} aria-label="Monter">↑</button>
+    <button data-act="${kind}down" ${at} ${pos === count - 1 ? "disabled" : ""} aria-label="Descendre">↓</button>
+    <button data-act="rm${kind}" ${at} ${count === 1 ? "disabled" : ""} aria-label="Retirer">×</button>
+  </div>`;
+}
+function edExercise(ex, i) {
+  const steps = ex.ladder
+    .map((st, j) => {
+      const p = `exercises.${i}.ladder.${j}`;
+      return `<div class="ed-step">
+        <div class="ex-head"><b class="small">Palier ${j + 1}</b>${edButtons("step", i, j, ex.ladder.length)}</div>
+        ${edStepFields(p, st)}
+        ${
+          st.home
+            ? `<div class="extra"><div class="ex-head"><span class="tag">🏠 variante maison</span><button class="x" data-act="rmhome" data-i="${i}" data-j="${j}" aria-label="Retirer">×</button></div>${edStepFields(`${p}.home`, st.home)}</div>`
+            : `<button class="ghost small-btn" data-act="addhome" data-i="${i}" data-j="${j}">+ variante maison</button>`
+        }
+      </div>`;
+    })
+    .join("");
+  return `<section class="card ed">
+    <div class="ex-head">${edField(`exercises.${i}.name`, ex.name, { ph: "Nom de l'exercice" })}${edButtons("ex", i, null, progEdit.exercises.length)}</div>
+    ${steps}
+    <button class="ghost" data-act="addstep" data-i="${i}">+ Ajouter un palier</button>
+  </section>`;
+}
+
+function renderProgramEditor() {
+  const view = $("#view");
+  const p = progEdit;
+  const text = (label, path, value) => `<label class="ed-label">${label}${edField(path, value)}</label>`;
+  view.innerHTML = `
+    <section class="card ed">
+      <h3>✏️ Mon programme</h3>
+      <p class="muted small">Change ce que tu veux, ou vide tout pour partir de zéro. Rien n'est appliqué avant « Enregistrer ».</p>
+      ${text("Nom du programme", "name", p.name)}
+      <p class="muted small">Tours du circuit</p>
+      <div class="seg">${[1, 2, 3, 4, 5].map((n) => `<button data-rounds="${n}" class="${p.rounds === n ? "on" : ""}">${n}</button>`).join("")}</div>
+      ${text("Repos entre les tours", "restBetweenRounds", p.restBetweenRounds)}
+    </section>
+    <section class="card ed">
+      <h3>Échauffement et retour au calme</h3>
+      ${text("Échauffement 🌳 parc", "warmup.parc", p.warmup.parc)}
+      ${text("Échauffement 🏠 maison", "warmup.maison", p.warmup.maison)}
+      ${text("Mobilité", "mobility", p.mobility)}
+      ${text("Retour au calme 🌳 parc", "cooldown.parc", p.cooldown.parc)}
+      ${text("Retour au calme 🏠 maison", "cooldown.maison", p.cooldown.maison)}
+    </section>
+    <p class="muted small pad">Exercices du circuit, dans l'ordre. Chaque exercice a un ou plusieurs paliers, du plus facile au plus dur : l'app propose le suivant quand tu fais le max partout, ${PROGRAM.advanceAfter} séances de suite.</p>
+    ${p.exercises.map(edExercise).join("")}
+    <button class="ghost wide" data-act="addex">+ Ajouter un exercice</button>
+    <button class="primary" id="progsave">Enregistrer le programme</button>
+    <div class="ed-actions">
+      <button class="ghost" id="progcancel">Annuler</button>
+      <button class="ghost" data-act="clear">Tout vider</button>
+      ${state.program ? `<button class="ghost danger" id="progreset">Revenir au programme de base</button>` : ""}
+    </div>`;
+
+  view.querySelectorAll("[data-p]").forEach((inp) =>
+    inp.addEventListener("input", () => {
+      const keys = inp.dataset.p.split(".");
+      const last = keys.pop();
+      const v = inp.dataset.num !== undefined ? parseInt(inp.value, 10) || 0 : inp.value;
+      keys.reduce((o, k) => o[k], p)[last] = v;
+    })
+  );
+  view.querySelectorAll("[data-rounds]").forEach((b) =>
+    b.addEventListener("click", () => {
+      p.rounds = +b.dataset.rounds;
+      renderProgramEditor();
+    })
+  );
+  const swap = (a, i, j) => ([a[i], a[j]] = [a[j], a[i]]);
+  const acts = {
+    addex: () => p.exercises.push({ id: "x" + Date.now().toString(36), name: "", ladder: [newStep()] }),
+    rmex: (i) => confirm("Retirer cet exercice du programme ? Son historique reste visible.") && p.exercises.splice(i, 1),
+    exup: (i) => swap(p.exercises, i, i - 1),
+    exdown: (i) => swap(p.exercises, i, i + 1),
+    addstep: (i) => p.exercises[i].ladder.push(newStep()),
+    rmstep: (i, j) => p.exercises[i].ladder.splice(j, 1),
+    stepup: (i, j) => swap(p.exercises[i].ladder, j, j - 1),
+    stepdown: (i, j) => swap(p.exercises[i].ladder, j, j + 1),
+    addhome: (i, j) => (p.exercises[i].ladder[j].home = newStep()),
+    rmhome: (i, j) => delete p.exercises[i].ladder[j].home,
+    clear: () => {
+      if (!confirm("Retirer tous les exercices pour partir de zéro ?")) return;
+      p.name = "Mon programme";
+      p.exercises = [{ id: "x" + Date.now().toString(36), name: "", ladder: [newStep()] }];
+    },
+  };
+  view.querySelectorAll("[data-act]").forEach((b) =>
+    b.addEventListener("click", () => {
+      acts[b.dataset.act](+b.dataset.i, +b.dataset.j);
+      renderProgramEditor();
+    })
+  );
+  $("#progsave").addEventListener("click", saveProgram);
+  $("#progcancel").addEventListener("click", () => show("reglages"));
+  if (state.program)
+    $("#progreset").addEventListener("click", () => {
+      if (!confirm("Revenir au programme de base ? Ton programme perso sera supprimé, l'historique reste.")) return;
+      state.program = null;
+      applyProgram(null);
+      PROGRAM.exercises.forEach((ex) => (state.levels[ex.id] = Math.min(state.levels[ex.id] || 0, ex.ladder.length - 1)));
+      state.transitions = {};
+      state.proposals = [];
+      state.draft = null;
+      save();
+      show("reglages");
+      toast("Programme de base rétabli");
+    });
+}
+
+// Première erreur de saisie du programme en cours d'édition, ou "" si tout est bon.
+function programError(p) {
+  if (!p.exercises.length) return "Ajoute au moins un exercice";
+  for (let i = 0; i < p.exercises.length; i++) {
+    const ex = p.exercises[i];
+    if (!ex.name.trim()) return `Exercice ${i + 1} : donne-lui un nom`;
+    for (let j = 0; j < ex.ladder.length; j++) {
+      const st = ex.ladder[j];
+      for (const [s, where] of [[st, ""], [st.home, " (variante maison)"]]) {
+        if (!s) continue;
+        const at = `${ex.name.trim()}, palier ${j + 1}${where}`;
+        if (!s.name.trim()) return `${at} : nom du mouvement manquant`;
+        if (!(s.min >= 1)) return `${at} : le minimum doit être au moins 1`;
+        if (!(s.max >= s.min)) return `${at} : le maximum doit être ≥ au minimum`;
+      }
+    }
+  }
+  return "";
+}
+
+function saveProgram() {
+  const p = progEdit;
+  const err = programError(p);
+  if (err) return toast(err);
+  p.name = p.name.trim() || "Mon programme";
+
+  // Ancien rang -> nouveau rang de chaque palier (−1 : palier retiré).
+  const maps = {};
+  p.exercises.forEach((ex) => {
+    ex.name = ex.name.trim();
+    const m = (maps[ex.id] = {});
+    ex.ladder.forEach((st, j) => {
+      if (st._from !== undefined) m[st._from] = j;
+      delete st._from;
+    });
+  });
+  const mapped = (id, lvl) => (maps[id][lvl] !== undefined ? maps[id][lvl] : -1);
+
+  state.sessions.forEach((s) =>
+    Object.keys(s.results).forEach((id) => {
+      if (!maps[id]) return;
+      const r = s.results[id];
+      [r, ...(r.extras || [])].forEach((e) => (e.level = mapped(id, e.level)));
+    })
+  );
+  p.exercises.forEach((ex) => {
+    const old = state.levels[ex.id];
+    const m = typeof old === "number" ? mapped(ex.id, old) : 0;
+    const lvl = m >= 0 ? m : Math.min(old, ex.ladder.length - 1);
+    if (state.transitions[ex.id] && mapped(ex.id, old + 1) !== lvl + 1) delete state.transitions[ex.id];
+    state.levels[ex.id] = lvl;
+  });
+  Object.keys(state.transitions).forEach((id) => maps[id] || delete state.transitions[id]);
+  state.levelLog = state.levelLog
+    .map((l) => (maps[l.exId] ? { ...l, level: mapped(l.exId, l.level) } : l))
+    .filter((l) => l.level >= 0);
+  if (state.draft && state.draft.extras)
+    Object.keys(state.draft.extras).forEach((id) => {
+      if (!maps[id]) return;
+      state.draft.extras[id] = state.draft.extras[id].map((x) => ({ ...x, level: mapped(id, x.level) })).filter((x) => x.level >= 0);
+    });
+
+  state.program = clone(p);
+  applyProgram(state.program);
+  state.proposals = state.proposals.filter((id) => {
+    const ex = PROGRAM.exercises.find((e) => e.id === id);
+    return ex && nextStep(ex);
+  });
+  save();
+  show("reglages");
+  toast("Programme enregistré 💪");
 }
 
 // ---------- Sauvegarde ----------
@@ -1315,21 +1597,262 @@ document.addEventListener("click", (e) => {
   TABS[tab]();
 });
 
+// ---------- Groupe ----------
+// Les données restent sur le téléphone. Ce résumé (semaine, dernières séances et sorties,
+// poids si partagé) est la seule chose envoyée, et seulement aux groupes rejoints.
+const SHARE_LAST = 20;
+function sharePayload() {
+  return JSON.stringify({
+    goals: { cali: state.settings.weeklyGoal, run: state.settings.runGoal },
+    streak: weeksStreak(),
+    program: PROGRAM.name,
+    sessions: state.sessions.slice(-SHARE_LAST).map((s) => ({ date: s.date, mode: s.mode, complete: !!s.complete, lines: sessionEntries(s) })),
+    runs: state.runs.slice(-SHARE_LAST).map((r) => ({ date: r.date, km: r.km, sec: r.sec })),
+    weights: state.settings.shareWeight
+      ? [...state.weights].sort((a, b) => a.date.localeCompare(b.date)).slice(-SHARE_LAST)
+      : null,
+  });
+}
+// Appelé à chaque enregistrement ; Cloud.publish n'envoie que si le résumé a changé.
+// Hors ligne l'envoi échoue en silence et repart au prochain enregistrement ou retour dans l'app.
+let publishTimer = null;
+function schedulePublish() {
+  if (typeof Cloud === "undefined" || !Cloud.account || !Cloud.account.groups.length) return;
+  clearTimeout(publishTimer);
+  publishTimer = setTimeout(() => Cloud.publish(sharePayload()).catch(() => {}), 1500);
+}
+
+const groupView = { code: null, members: null, error: "", busy: false };
+// Lance une action réseau ; l'écran n'est redessiné qu'en cas de succès pour ne pas perdre la saisie.
+async function cloudDo(fn, okMsg) {
+  if (groupView.busy) return;
+  groupView.busy = true;
+  toast("Un instant…");
+  let ok = false;
+  try {
+    ok = (await fn()) !== null;
+    if (ok) toast(okMsg);
+  } catch (e) {
+    toast(Cloud.message(e));
+  }
+  groupView.busy = false;
+  if (ok && tab === "groupe") renderGroup();
+}
+async function loadMembers() {
+  const code = groupView.code;
+  let members = null, error = "";
+  try {
+    members = await Cloud.members(code);
+  } catch (e) {
+    error = Cloud.message(e);
+  }
+  if (groupView.code !== code) return;
+  if (members) groupView.members = members;
+  groupView.error = error;
+  if (tab === "groupe") renderGroup(false);
+}
+
+function memberCard(m) {
+  const d = m.data;
+  const list = (a) => (Array.isArray(a) ? a.filter((x) => x && typeof x.date === "string") : []);
+  const sessions = list(d.sessions), runs = list(d.runs), weights = list(d.weights);
+  const goals = d.goals || {};
+  const week = weekHtml(new Set(sessions.map((s) => s.date)), new Set(runs.map((r) => r.date)), +goals.cali || 0, +goals.run || 0, +d.streak || 0);
+  const me = m.uid === Cloud.account.uid;
+
+  const sess = sessions
+    .slice(-5)
+    .reverse()
+    .map(
+      (s) => `<p class="small member-date"><b>${esc(prettyDate(s.date))}</b> <span class="muted">· ${s.mode === "maison" ? "🏠 maison" : "🌳 parc"} · ${s.complete ? "complète" : "partielle"}</span></p>
+        ${entryLines(Array.isArray(s.lines) ? s.lines : [])}`
+    )
+    .join("");
+  const runLines = runs
+    .slice(-5)
+    .reverse()
+    .map((r) => {
+      const km = +r.km || 0, sec = +r.sec || 0;
+      return `<div class="hist"><span>${esc(prettyDate(r.date))}</span><span class="grow"><b>${fmtKm(km)} km</b>${km > 0 && sec > 0 ? ` · ${fmtPace(sec / km)}/km` : ""}</span></div>`;
+    })
+    .join("");
+  let weight = "";
+  if (weights.length) {
+    const first = +weights[0].kg || 0, last = +weights[weights.length - 1].kg || 0;
+    const delta = last - first;
+    weight = `<div class="hist"><span class="grow">⚖️ Poids</span><b>${last.toFixed(1)} kg${
+      weights.length > 1 ? ` <small class="muted">${delta > 0 ? "+" : ""}${delta.toFixed(1)} depuis le ${esc(prettyDate(weights[0].date))}</small>` : ""
+    }</b></div>`;
+  }
+
+  return `<section class="card">
+    <p class="member-name"><b>${esc(m.pseudo)}</b>${me ? ` <span class="tag">toi</span>` : ""}
+      <span class="muted small">${d.program ? `· ${esc(d.program)} ` : ""}${m.updated ? `· à jour le ${esc(prettyDate(ymd(new Date(m.updated))))}` : ""}</span></p>
+    ${week.html}
+    ${weight}
+    <details class="sess member-more"><summary><span>Séances et sorties</span></summary>
+      <div class="sess-body">
+        ${sess || `<p class="muted small">Pas encore de séance.</p>`}
+        ${runLines ? `<p class="small member-date"><b>🏃 Sorties</b></p>${runLines}` : ""}
+      </div>
+    </details>
+  </section>`;
+}
+
+function renderGroup(fetch = true) {
+  const view = $("#view");
+  if (!Cloud.enabled) {
+    view.innerHTML = `<section class="card"><h3>👥 Groupe</h3>
+      <p class="muted small">Les groupes ne sont pas encore activés sur cette version de l'app (voir « Activer les groupes » dans le README).</p></section>`;
+    return;
+  }
+  const acc = Cloud.account;
+  if (!acc) {
+    view.innerHTML = `<section class="card ed">
+      <h3>👥 Rejoins tes potes</h3>
+      <p class="muted small">Un pseudo et un code à 4 chiffres, c'est tout. Pas de mail. Nouveau pseudo : le compte est créé. Pseudo existant : tu te reconnectes avec ton code.</p>
+      <label class="ed-label">Pseudo<input type="text" id="lpseudo" maxlength="20" autocomplete="username" autocapitalize="off" spellcheck="false"></label>
+      <label class="ed-label">Code à 4 chiffres<input type="text" id="lpin" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="••••"></label>
+      <button class="primary" id="login">Entrer</button>
+      <p class="muted small">Tes données restent sur ton téléphone. Une fois dans un groupe, ses membres voient ta semaine, le détail de tes dernières séances et sorties, et ton poids (désactivable). Retiens ton code : sans mail, il ne peut pas être récupéré.</p>
+    </section>`;
+    $("#login").addEventListener("click", () =>
+      cloudDo(async () => {
+        const a = await Cloud.login($("#lpseudo").value, $("#lpin").value.trim(), (name) =>
+          confirm(`Pas de compte « ${name} » avec ce code.\n\nCréer ce pseudo avec ce code ?`)
+        );
+        if (a) schedulePublish();
+        return a;
+      }, "Connecté 👋")
+    );
+    return;
+  }
+
+  if (!acc.groups.some((g) => g.code === groupView.code)) {
+    groupView.code = acc.groups.length ? acc.groups[0].code : null;
+    groupView.members = null;
+    groupView.error = "";
+  }
+  const group = acc.groups.find((g) => g.code === groupView.code);
+  // Saisie en cours à conserver quand la liste des membres arrive
+  const typed = ["#gcode", "#gname"].map((s) => ($(s) ? $(s).value : ""));
+
+  const week = (m) => {
+    const d = new Set((Array.isArray(m.data.sessions) ? m.data.sessions : []).map((s) => s && s.date));
+    const monday = mondayOf(today());
+    return [0, 1, 2, 3, 4, 5, 6].filter((i) => d.has(addDays(monday, i))).length;
+  };
+  const members = groupView.members
+    ? [...groupView.members].sort((a, b) => (b.uid === acc.uid) - (a.uid === acc.uid) || week(b) - week(a) || a.pseudo.localeCompare(b.pseudo))
+    : null;
+
+  view.innerHTML =
+    `<section class="card">
+      <div class="ex-head"><b>👤 ${esc(acc.pseudo)}</b><button class="ghost" id="logout">Se déconnecter</button></div>
+      <label class="check plain ${state.settings.shareWeight ? "on" : ""}"><input type="checkbox" id="sharew" ${state.settings.shareWeight ? "checked" : ""}>
+        <span class="box"></span><span>Partager mon poids avec mes groupes</span></label>
+    </section>` +
+    (acc.groups.length > 1
+      ? `<div class="seg kinds">${acc.groups.map((g) => `<button data-group="${esc(g.code)}" class="${g.code === groupView.code ? "on" : ""}">${esc(g.name)}</button>`).join("")}</div>`
+      : "") +
+    (group
+      ? `<section class="card">
+          <h3>👥 ${esc(group.name)}</h3>
+          <p class="small">Code du groupe : <b class="code">${esc(group.code)}</b> <span class="muted">· à donner à tes potes</span></p>
+          <div class="choices">
+            <button class="primary small" id="ginvite">Inviter</button>
+            <button class="ghost" id="grefresh">Actualiser</button>
+            <button class="ghost danger" id="gleave">Quitter</button>
+          </div>
+        </section>` +
+        (groupView.error ? `<section class="card"><p class="warn">⚠️ ${esc(groupView.error)}</p></section>` : "") +
+        (members ? members.map(memberCard).join("") : groupView.error ? "" : `<p class="muted small pad">Chargement des membres…</p>`)
+      : "") +
+    `<section class="card ed">
+      <h3>${acc.groups.length ? "Un autre groupe" : "Ton premier groupe"}</h3>
+      <p class="muted small">Rejoins avec le code d'un pote, ou crée un groupe et donne-lui le code.</p>
+      <div class="row"><input type="text" id="gcode" maxlength="6" placeholder="Code du groupe" autocapitalize="characters" autocomplete="off" spellcheck="false"><button class="primary small" id="gjoin">Rejoindre</button></div>
+      <div class="row"><input type="text" id="gname" maxlength="40" placeholder="Nom d'un nouveau groupe" autocomplete="off"><button class="primary small" id="gcreate">Créer</button></div>
+    </section>`;
+
+  $("#gcode").value = typed[0];
+  $("#gname").value = typed[1];
+
+  $("#logout").addEventListener("click", () => {
+    if (!confirm("Te déconnecter ? Tes séances restent sur ce téléphone et tu restes membre de tes groupes.")) return;
+    cloudDo(() => Cloud.logout(), "Déconnecté");
+  });
+  $("#sharew").addEventListener("change", (e) => {
+    state.settings.shareWeight = e.target.checked;
+    save();
+    e.target.closest(".check").classList.toggle("on", e.target.checked);
+  });
+  view.querySelectorAll("[data-group]").forEach((b) =>
+    b.addEventListener("click", () => {
+      groupView.code = b.dataset.group;
+      groupView.members = null;
+      groupView.error = "";
+      renderGroup();
+    })
+  );
+  const joined = (g) => {
+    groupView.code = g.code;
+    groupView.members = null;
+    $("#gcode").value = $("#gname").value = "";
+  };
+  $("#gjoin").addEventListener("click", () => cloudDo(async () => joined(await Cloud.joinGroup($("#gcode").value, sharePayload())), "Groupe rejoint 🎉"));
+  $("#gcreate").addEventListener("click", () => cloudDo(async () => joined(await Cloud.createGroup($("#gname").value, sharePayload())), "Groupe créé 🎉"));
+  if (!group) return;
+
+  $("#ginvite").addEventListener("click", async () => {
+    const text = `Rejoins mon groupe « ${group.name} » sur Calliboss : ${location.origin}${location.pathname} → onglet Groupe, code ${group.code}`;
+    try {
+      if (navigator.share) await navigator.share({ text });
+      else {
+        await navigator.clipboard.writeText(text);
+        toast("Invitation copiée");
+      }
+    } catch (e) {}
+  });
+  $("#grefresh").addEventListener("click", () => {
+    schedulePublish();
+    loadMembers();
+  });
+  $("#gleave").addEventListener("click", () => {
+    if (!confirm(`Quitter « ${group.name} » ? Les autres ne verront plus tes séances.`)) return;
+    cloudDo(() => Cloud.leaveGroup(group.code), "Groupe quitté");
+  });
+  if (fetch) loadMembers();
+}
+
 // ---------- Navigation ----------
-const TABS = { seance: renderSession, progres: renderProgress, historique: renderHistory, poids: renderWeight, reglages: renderSettings };
+const TABS = { seance: renderSession, progres: renderProgress, historique: renderHistory, groupe: renderGroup, poids: renderWeight, reglages: renderSettings };
 let tab = "seance";
 function show(name) {
   tab = name;
+  progEdit = null;
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("on", b.dataset.tab === name));
   TABS[name]();
   window.scrollTo(0, 0);
 }
 document.querySelectorAll("nav button").forEach((b) => b.addEventListener("click", () => show(b.dataset.tab)));
 
-// Recharge la vue si l'app reste ouverte après minuit
+// Recharge la vue si l'app reste ouverte après minuit. Pas l'éditeur ni l'onglet Groupe :
+// on y revient souvent d'une autre app (copier un code) avec une saisie en cours.
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") TABS[tab]();
+  if (document.visibilityState !== "visible") return;
+  schedulePublish();
+  if (!progEdit && tab !== "groupe") TABS[tab]();
 });
+
+// Session du compte : vérifiée en arrière-plan, sans bloquer l'app ni exiger de réseau.
+if (Cloud.enabled && Cloud.account)
+  Cloud.sync()
+    .then(() => {
+      schedulePublish();
+      if (tab === "groupe") renderGroup();
+    })
+    .catch(() => {});
 
 if ("serviceWorker" in navigator && location.protocol !== "file:") {
   navigator.serviceWorker.register("sw.js").catch(() => {});

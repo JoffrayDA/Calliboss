@@ -9,6 +9,7 @@
   --ok: #3ecf8e;
   --bad: #ff5c5c;
   --chart: #f2601f;
+  --run: #3b82f6;
 }
 @media (prefers-color-scheme: light) {
   :root {
@@ -192,8 +193,9 @@ select { font: inherit; color: var(--text); background: var(--bg); border: 1px s
 
 /* Course + mobilité */
 .counters { display: flex; gap: 22px; }
-.day { position: relative; }
-.day.run::after { content: ""; position: absolute; bottom: -7px; left: 50%; width: 6px; height: 6px; margin-left: -3px; border-radius: 50%; background: var(--ok); }
+.day.run { background: var(--run); border-color: var(--run); color: #fff; font-weight: 700; }
+/* Cali + course le même jour : pastille moitié orange, moitié bleue */
+.day.done.run { background: linear-gradient(135deg, var(--accent) 50%, var(--run) 50%) border-box; border-color: transparent; }
 .kinds { margin-bottom: 12px; }
 .coach h3 { margin-bottom: 6px; }
 .coach p { margin: 0 0 6px; }
@@ -205,3 +207,32 @@ select { font: inherit; color: var(--text); background: var(--bg); border: 1px s
 .pace { margin: 12px 0 0; font-size: 15px; }
 .pace:empty { display: none; }
 .warn { margin: 8px 0 0; padding: 8px 10px; border-radius: 10px; background: color-mix(in srgb, var(--accent) 14%, transparent); font-size: 14px; }
+
+/* Éditeur de programme */
+.ed input, .ed select { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px; font-size: 16px; }
+.ed-label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); margin-top: 10px; }
+.ed-step { border-top: 1px solid var(--line); padding: 12px 0; }
+.ed-grid { display: grid; gap: 8px; margin-top: 8px; }
+.ed-range { display: flex; gap: 8px; align-items: center; }
+.ed-range span { color: var(--muted); font-size: 14px; }
+.ed-range select { flex: none; }
+.ed-btns { display: flex; gap: 4px; flex: none; }
+.ed-btns button { width: 36px; height: 36px; border: 1px solid var(--line); background: var(--bg); border-radius: 8px; }
+.ed-btns button:disabled { opacity: .3; }
+.ed .ex-head { align-items: center; }
+.ed-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.ed-actions .ghost { margin: 0; }
+.wide { display: block; width: 100%; margin: 0 0 12px; }
+
+/* Groupe */
+.ed .primary { margin-top: 12px; }
+.ed .row .primary { margin-top: 0; flex: none; }
+.ed .row { margin-top: 8px; }
+.ed .row input { flex: 1; }
+.check.plain.on span:last-child { color: inherit; text-decoration: none; }
+.code { font-family: ui-monospace, Consolas, monospace; font-size: 18px; letter-spacing: .12em; }
+.choices .danger { margin-top: 0; }
+.member-name { margin: 0 0 12px; }
+.member-date { margin: 12px 0 2px; }
+.member-more { margin-top: 14px; }
+.member-more summary > span:first-child { color: var(--muted); font-weight: 400; font-size: 14px; }
