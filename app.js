@@ -1855,6 +1855,9 @@ if (Cloud.enabled && Cloud.account)
     .catch(() => {});
 
 if ("serviceWorker" in navigator && location.protocol !== "file:") {
+  // Nouvelle version installée pendant que l'app est ouverte : on recharge pour ne pas
+  // mélanger ancien et nouveau code. La séance en cours est déjà enregistrée à chaque saisie.
+  if (navigator.serviceWorker.controller) navigator.serviceWorker.addEventListener("controllerchange", () => location.reload());
   navigator.serviceWorker.register("sw.js").catch(() => {});
 }
 
